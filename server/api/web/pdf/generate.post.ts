@@ -1,4 +1,4 @@
-export default defineEventHandler(async (event) => {
+export default defineEventHandler(async event => {
   const html = await readBody<string>(event);
   if (!html || typeof html !== 'string') {
     throw createError({ statusCode: 400, statusMessage: '请求体必须是 HTML 字符串' });
@@ -18,8 +18,13 @@ export default defineEventHandler(async (event) => {
     await page.setViewport({ width: 794, height: 1123 });
     await page.setContent(html, { waitUntil: 'load', timeout: 60_000 });
 
-    const contentHeight = await page.evaluate(
-      () => Math.max(document.body.scrollHeight, document.body.offsetHeight, document.documentElement.scrollHeight, document.documentElement.offsetHeight),
+    const contentHeight = await page.evaluate(() =>
+      Math.max(
+        document.body.scrollHeight,
+        document.body.offsetHeight,
+        document.documentElement.scrollHeight,
+        document.documentElement.offsetHeight
+      )
     );
 
     const pdfBuffer = await page.pdf({

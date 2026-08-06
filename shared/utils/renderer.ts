@@ -1,4 +1,5 @@
 import * as cheerio from 'cheerio';
+import { sanitizeWechatHtmlDocument } from '#shared/utils/html';
 import { getMetadataCache } from '~/store/v2/metadata';
 import { renderComments } from '~/utils/comment';
 import type { ArticleMetadata } from '~/utils/download/types';
@@ -26,7 +27,7 @@ export async function renderHTMLFromCgiDataNew(cgiData: any, comments = true) {
     commentHTML = await renderComments(cgiData.link);
   }
 
-  return `<!DOCTYPE html>
+  const renderedHtml = `<!DOCTYPE html>
 <html lang="zh_CN">
 <head>
     <meta charset="utf-8">
@@ -34,7 +35,7 @@ export async function renderHTMLFromCgiDataNew(cgiData: any, comments = true) {
     <meta http-equiv="X-UA-Compatible" content="IE=edge">
     <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=0,viewport-fit=cover">
     <meta name="referrer" content="no-referrer">
-    <title>${title}</title>
+    <title>${escapeHtml(title)}</title>
     <style>
         * {
             margin: 0;
@@ -185,9 +186,9 @@ export async function renderHTMLFromCgiDataNew(cgiData: any, comments = true) {
 </head>
 <body>
 <div class="__page_content__">
-<h1 class="title">${title}</h1>
+<h1 class="title">${escapeHtml(title)}</h1>
 ${meta}
-<blockquote class="source">原文地址: <a href="${cgiData.link}">${cgiData.link}</a></blockquote>
+<blockquote class="source">原文地址: <a href="${escapeHtml(cgiData.link)}">${escapeHtml(cgiData.link)}</a></blockquote>
 ${contentHTML}
 ${commentHTML}
 
@@ -195,6 +196,7 @@ ${bottomBarHTML}
 </div>
 </body>
 </html>`;
+  return sanitizeWechatHtmlDocument(renderedHtml);
 }
 
 /**
@@ -206,21 +208,49 @@ function extractTitle(cgiData: any): string {
   switch (cgiData.item_show_type) {
     case ITEM_SHOW_TYPE.图片分享:
     case ITEM_SHOW_TYPE.普通图文:
-      title = cgiData.title;
+      title = cgiData.title || '(无标题)';
       break;
-    case ITEM_SHOW_TYPE.文本分享:
-      if (cgiData.text_page_info.is_user_title === 1) {
-        title = cgiData.title;
+    case ITEM_SHOW_TYPE.文本分享: {
+      const textPageInfo = cgiData.text_page_info || {};
+      if (textPageInfo.is_user_title === 1 || textPageInfo.is_user_title === '1') {
+        title = cgiData.title || extractTextTitleFallback(cgiData);
       } else {
-        const content = cgiData.text_page_info?.content_noencode || cgiData.title || '';
-        title = content.replace(/\n/g, ' ').slice(0, 20) || '(无标题)';
+        title = extractTextTitleFallback(cgiData);
       }
       break;
+    }
     default:
       title = '(unknown)';
       break;
   }
   return title;
+}
+
+function extractTextTitleFallback(cgiData: any): string {
+  const text = cleanInlineText(cgiData.text_page_info?.content_noencode || cgiData.title || '');
+  return text ? text.slice(0, 20) : '(无标题)';
+}
+
+function cleanInlineText(value: unknown): string {
+  return String(value ?? '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function escapeHtml(value: unknown): string {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function renderTextContentSection(className: string, value: unknown): string {
+  const textContent = escapeHtml(value).replace(/\r?\n/g, '<br />');
+  return `<section class="${className}">
+<p class="text_content">${textContent}</p>
+</section>`;
 }
 
 /**
@@ -266,7 +296,7 @@ function isPayPreviewPlaceholder(contentNoencode: string | undefined): boolean {
  */
 function renderContent_paySubscribe(cgiData: any): string {
   const payInfo = cgiData.pay_subscribe_info || {};
-  const desc = (payInfo.desc || '').replace(/\r?\n/g, '<br />');
+  const desc = escapeHtml(payInfo.desc || '').replace(/\r?\n/g, '<br />');
   const fee = payInfo.fee ? `${payInfo.fee / 100} 元` : '';
   const wecoinAmount = payInfo.wecoin_amount ? `${payInfo.wecoin_amount} 微币` : '';
   const priceText = fee || wecoinAmount || '付费';
@@ -284,7 +314,7 @@ ${desc ? `<div class="pay_subscribe_desc">${desc}</div>` : ''}
  */
 function renderContent_8(cgiData: any): string {
   // 文本内容
-  let textContent = cgiData.content_noencode.replace(/\n/g, '<br />');
+  let textContent = String(cgiData.content_noencode || '').replace(/\n/g, '<br />');
   // 替换函数：在<a> 标签上插入 href 属性，href="#图X"
   const regex = /(<a class="wx_img_refer_link" data-seq="(\d+)" data-refer="图\2" style="[^"]*">)(\s*图\2\s*)(<\/a>)/g;
   textContent = textContent.replace(regex, (match: any, openTag: any, number: any, content: any, closeTag: any) => {
@@ -298,7 +328,7 @@ function renderContent_8(cgiData: any): string {
     .map(
       (url: string, idx: number) =>
         `<div class="picture_item" id="图${idx + 1}">
-    <img class="picture_item_img" src="${url}" alt="图${idx + 1}" />
+    <img class="picture_item_img" src="${escapeHtml(url)}" alt="图${idx + 1}" />
     <p class="picture_item_label">图${idx + 1}</p>
 </div>`
     )
@@ -316,11 +346,8 @@ function renderContent_8(cgiData: any): string {
  */
 function renderContent_10(cgiData: any): string {
   // 文本内容
-  const textContent = cgiData.text_page_info.content_noencode.replace(/\n/g, '<br />');
-
-  return `<section class="item_show_type_10">
-<p class="text_content">${textContent}</p>
-</section>`;
+  const textContent = cgiData.text_page_info?.content_noencode || cgiData.title || '';
+  return renderTextContentSection('item_show_type_10', textContent);
 }
 
 /**
@@ -329,12 +356,6 @@ function renderContent_10(cgiData: any): string {
  */
 function renderContent_0(cgiData: any): string {
   let contentHTML = cgiData.content_noencode || '';
-
-  const $check = cheerio.load(contentHTML, null, false);
-  if (!$check.text().replace(/[\s\u00A0]+/g, '') && cgiData.title) {
-    const titleText = cgiData.title.replace(/\n/g, '<br />');
-    return `<section class="item_show_type_0"><p class="text_content">${titleText}</p></section>`;
-  }
 
   // 使用 cheerio 处理 HTML 片段
   const $ = cheerio.load(contentHTML, null, false);
@@ -361,6 +382,10 @@ function renderContent_0(cgiData: any): string {
 
   // 获取处理后的 HTML 片段（cheerio 会正确序列化多顶级元素和自闭合标签）
   let modifiedContent = $.html();
+  const visibleText = $.text().replace(/[\s\u00A0]+/g, '');
+  if (!visibleText && $('img').length === 0 && cgiData.title) {
+    return renderTextContentSection('item_show_type_0', cgiData.title);
+  }
   return `<section class="item_show_type_0">${modifiedContent}</section>`;
 }
 
@@ -383,14 +408,14 @@ export function renderTextFromCgiDataNew(cgiData: any): string {
     case ITEM_SHOW_TYPE.普通图文: {
       // 普通图文 & 文章分享（都是 item_show_type=0）
       const $ = cheerio.load(cgiData.content_noencode || '', null, false);
-      text = $.text();
+      text = $.text() || cgiData.title || '';
       break;
     }
     case ITEM_SHOW_TYPE.图片分享:
       text = cgiData.content_noencode || '';
       break;
     case ITEM_SHOW_TYPE.文本分享:
-      text = cgiData.text_page_info?.content_noencode || '';
+      text = cgiData.text_page_info?.content_noencode || cgiData.title || '';
       break;
     default:
       break;
@@ -405,10 +430,10 @@ export function renderTextFromCgiDataNew(cgiData: any): string {
 function renderMetaInfo(cgiData: any): string {
   return `<div class="__meta__">
     <span class="copyright">原创</span>
-    <span class="author">${cgiData.author}</span>
-    <span class="nick_name">${cgiData.nick_name}</span>
-    <span class="create_time">${cgiData.create_time}</span>
-    <span class="ip">${cgiData.ip_wording?.province_name}</span>
+    <span class="author">${escapeHtml(cgiData.author)}</span>
+    <span class="nick_name">${escapeHtml(cgiData.nick_name)}</span>
+    <span class="create_time">${escapeHtml(cgiData.create_time)}</span>
+    <span class="ip">${escapeHtml(cgiData.ip_wording?.province_name)}</span>
 </div>`;
 }
 
@@ -427,8 +452,8 @@ async function renderBottomBar(cgiData: any) {
 
   return `<div class="__bottom-bar__">
 <div class="left">
-<img src="${cgiData.round_head_img}" alt="" style="width: 32px;height: 32px;margin-right: 8px;">
-<span>${cgiData.nick_name}</span>
+<img src="${escapeHtml(cgiData.round_head_img)}" alt="" style="width: 32px;height: 32px;margin-right: 8px;">
+<span>${escapeHtml(cgiData.nick_name)}</span>
 </div>
 
 <div class="right">

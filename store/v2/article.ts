@@ -1,8 +1,61 @@
-import type { AppMsgExWithFakeID, PublishInfo, PublishPage } from '~/types/types';
+import {
+  articleMessageId,
+  countNewArticleCacheEntries,
+  reconcileArticleMessageTotal,
+} from '#shared/utils/article-cache';
+import type { ArticleHighWatermark } from '#shared/utils/incremental-sync';
+import type { AppMsgEx, AppMsgExWithFakeID, PublishInfo, PublishPage } from '~/types/types';
 import { db } from './db';
 import { type MpAccount, updateInfoCache } from './info';
 
 export type ArticleAsset = AppMsgExWithFakeID;
+
+export async function getArticleHighWatermark(fakeid: string): Promise<ArticleHighWatermark | null> {
+  const articles = await db.article.where('fakeid').equals(fakeid).toArray();
+  const publishTimestamp = articles.reduce((latest, article) => Math.max(latest, article.create_time), 0);
+  if (!publishTimestamp) return null;
+
+  return {
+    publishTimestamp,
+    articleIds: Array.from(
+      new Set(articles.filter(article => article.create_time === publishTimestamp).map(article => article.aid))
+    ).sort(),
+  };
+}
+
+async function persistArticleGroups(
+  account: MpAccount,
+  articleGroups: AppMsgEx[][],
+  completed: boolean,
+  totalCount: number,
+  replaceCompletion = false
+) {
+  await db.transaction('rw', ['article', 'info'], async () => {
+    const fakeid = account.fakeid;
+    const existingKeys = await db.article.toCollection().keys();
+    const { articleCount, messageCount } = countNewArticleCacheEntries(existingKeys, fakeid, articleGroups);
+
+    for (const articles of articleGroups) {
+      for (const article of articles) {
+        const key = `${fakeid}:${article.aid}`;
+        await db.article.put({ ...article, fakeid, _status: '' }, key);
+      }
+    }
+
+    await updateInfoCache(
+      {
+        fakeid,
+        completed,
+        count: messageCount,
+        articles: articleCount,
+        nickname: account.nickname,
+        round_head_img: account.round_head_img,
+        total_count: reconcileArticleMessageTotal(totalCount, account.count, messageCount),
+      },
+      { replaceCompletion }
+    );
+  });
+}
 
 /**
  * 更新文章缓存
@@ -10,45 +63,72 @@ export type ArticleAsset = AppMsgExWithFakeID;
  * @param publish_page
  */
 export async function updateArticleCache(account: MpAccount, publish_page: PublishPage) {
-  await db.transaction('rw', ['article', 'info'], async () => {
-    const keys = await db.article.toCollection().keys();
-
-    const fakeid = account.fakeid;
-    const total_count = publish_page.total_count;
-    const publish_list = publish_page.publish_list.filter(item => !!item.publish_info);
-
-    // 统计本次缓存成功新增的数量
-    let msgCount = 0;
-    let articleCount = 0;
-
-    for (const item of publish_list) {
-      const publish_info: PublishInfo = JSON.parse(item.publish_info);
-      let newEntryCount = 0;
-
-      for (const article of publish_info.appmsgex) {
-        const key = await db.article.put({ ...article, fakeid, _status: '' }, `${fakeid}:${article.aid}`);
-        if (!keys.includes(key)) {
-          newEntryCount++;
-          articleCount++;
-        }
-      }
-
-      if (newEntryCount > 0) {
-        // 新增成功
-        msgCount++;
-      }
-    }
-
-    await updateInfoCache({
-      fakeid: fakeid,
-      completed: publish_list.length === 0,
-      count: msgCount,
-      articles: articleCount,
-      nickname: account.nickname,
-      round_head_img: account.round_head_img,
-      total_count: total_count,
-    });
+  const publishList = publish_page.publish_list.filter(item => !!item.publish_info);
+  const articleGroups = publishList.map(item => {
+    const publishInfo: PublishInfo = JSON.parse(item.publish_info);
+    return publishInfo.appmsgex;
   });
+  await persistArticleGroups(account, articleGroups, publishList.length === 0, publish_page.total_count);
+}
+
+export async function updateProfileArticleCache(
+  account: MpAccount,
+  articles: AppMsgEx[],
+  options: { completed: boolean; replaceCompletion?: boolean; totalCount: number }
+) {
+  const groups = new Map<string, AppMsgEx[]>();
+  for (const article of articles) {
+    const messageId = articleMessageId(article);
+    const group = groups.get(messageId) || [];
+    group.push(article);
+    groups.set(messageId, group);
+  }
+  await persistArticleGroups(
+    account,
+    Array.from(groups.values()),
+    options.completed,
+    options.totalCount,
+    options.replaceCompletion
+  );
+}
+
+function normalizedLinkIdentity(value: string) {
+  try {
+    const url = new URL(value);
+    url.hash = '';
+    url.searchParams.sort();
+    return url.toString();
+  } catch {
+    return value.trim();
+  }
+}
+
+export async function recoverLocalArticleCache(account: MpAccount, articles: AppMsgEx[]) {
+  if (articles.length === 0) return { articleCount: 0, messageCount: 0 };
+
+  const existing = await db.article.where('fakeid').equals(account.fakeid).toArray();
+  const existingKeys = new Set(existing.map(article => `${account.fakeid}:${article.aid}`));
+  const existingLinks = new Set(existing.map(article => normalizedLinkIdentity(article.link)));
+  const accepted: AppMsgEx[] = [];
+
+  for (const article of articles) {
+    const key = `${account.fakeid}:${article.aid}`;
+    const link = normalizedLinkIdentity(article.link);
+    if (existingKeys.has(key) || existingLinks.has(link)) continue;
+    existingKeys.add(key);
+    existingLinks.add(link);
+    accepted.push(article);
+  }
+
+  const existingMessageIds = new Set(existing.map(articleMessageId));
+  const messageCount = new Set(accepted.map(articleMessageId).filter(messageId => !existingMessageIds.has(messageId)))
+    .size;
+  await updateProfileArticleCache(account, accepted, {
+    completed: false,
+    replaceCompletion: true,
+    totalCount: Math.max(account.total_count, account.count + messageCount),
+  });
+  return { articleCount: accepted.length, messageCount };
 }
 
 /**

@@ -1,9 +1,169 @@
 import { formatElapsedTime } from '#shared/utils/helpers';
 import toastFactory from '~/composables/toast';
-import { Exporter } from '~/utils/download/Exporter';
+import { Exporter, type FileExportQueueResult } from '~/utils/download/Exporter';
 import type { ExporterStatus } from '~/utils/download/types';
 
-export default () => {
+type ExportType = 'excel' | 'json' | 'html' | 'txt' | 'markdown' | 'word' | 'pdf';
+
+interface ExportConfig {
+  label: string;
+  beginPhase: string;
+  events: (ctx: {
+    phase: Ref<string>;
+    completed_count: Ref<number>;
+    total_count: Ref<number>;
+  }) => Record<string, (...args: any[]) => void>;
+}
+
+const EXPORT_CONFIGS: Record<ExportType, ExportConfig> = {
+  excel: {
+    label: 'Excel',
+    beginPhase: '导出中',
+    events: ctx => ({
+      'export:begin': () => {
+        ctx.phase.value = '导出中';
+        ctx.completed_count.value = 0;
+        ctx.total_count.value = 0;
+      },
+      'export:total': (total: number) => {
+        ctx.total_count.value = total;
+      },
+      'export:progress': (num: number) => {
+        ctx.completed_count.value = num;
+      },
+    }),
+  },
+  json: {
+    label: 'Json',
+    beginPhase: '导出中',
+    events: ctx => ({
+      'export:begin': () => {
+        ctx.phase.value = '导出中';
+        ctx.completed_count.value = 0;
+        ctx.total_count.value = 0;
+      },
+      'export:total': (total: number) => {
+        ctx.total_count.value = total;
+      },
+      'export:progress': (num: number) => {
+        ctx.completed_count.value = num;
+      },
+    }),
+  },
+  html: {
+    label: 'HTML',
+    beginPhase: '资源解析中',
+    events: ctx => ({
+      'export:begin': () => {
+        ctx.phase.value = '资源解析中';
+        ctx.completed_count.value = 0;
+        ctx.total_count.value = 0;
+      },
+      'export:download': (total: number) => {
+        ctx.phase.value = '资源下载中';
+        ctx.completed_count.value = 0;
+        ctx.total_count.value = total;
+      },
+      'export:download:progress': (_url: string, _success: boolean, status: ExporterStatus) => {
+        ctx.completed_count.value = status.completed.length;
+      },
+      'export:write': (total: number) => {
+        ctx.phase.value = '文件写入中';
+        ctx.completed_count.value = 0;
+        ctx.total_count.value = total;
+      },
+      'export:write:progress': (index: number) => {
+        ctx.completed_count.value = index;
+      },
+    }),
+  },
+  txt: {
+    label: 'Txt',
+    beginPhase: '资源解析中',
+    events: ctx => ({
+      'export:begin': () => {
+        ctx.phase.value = '资源解析中';
+        ctx.completed_count.value = 0;
+        ctx.total_count.value = 0;
+      },
+      'export:total': (total: number) => {
+        ctx.phase.value = '导出中';
+        ctx.completed_count.value = 0;
+        ctx.total_count.value = total;
+      },
+      'export:progress': (index: number) => {
+        ctx.completed_count.value = index;
+      },
+    }),
+  },
+  markdown: {
+    label: 'Markdown',
+    beginPhase: '资源解析中',
+    events: ctx => ({
+      'export:begin': () => {
+        ctx.phase.value = '资源解析中';
+        ctx.completed_count.value = 0;
+        ctx.total_count.value = 0;
+      },
+      'export:total': (total: number) => {
+        ctx.phase.value = '导出中';
+        ctx.completed_count.value = 0;
+        ctx.total_count.value = total;
+      },
+      'export:progress': (index: number) => {
+        ctx.completed_count.value = index;
+      },
+    }),
+  },
+  word: {
+    label: 'Word',
+    beginPhase: '资源解析中',
+    events: ctx => ({
+      'export:begin': () => {
+        ctx.phase.value = '资源解析中';
+        ctx.completed_count.value = 0;
+        ctx.total_count.value = 0;
+      },
+      'export:total': (total: number) => {
+        ctx.phase.value = '导出中';
+        ctx.completed_count.value = 0;
+        ctx.total_count.value = total;
+      },
+      'export:progress': (index: number) => {
+        ctx.completed_count.value = index;
+      },
+    }),
+  },
+  pdf: {
+    label: 'PDF',
+    beginPhase: '资源解析中',
+    events: ctx => ({
+      'export:begin': () => {
+        ctx.phase.value = '资源解析中';
+        ctx.completed_count.value = 0;
+        ctx.total_count.value = 0;
+      },
+      'export:download': (total: number) => {
+        ctx.phase.value = '资源下载中';
+        ctx.completed_count.value = 0;
+        ctx.total_count.value = total;
+      },
+      'export:download:progress': (_url: string, _success: boolean, status: ExporterStatus) => {
+        ctx.completed_count.value = status.completed.length;
+      },
+      'export:write': (total: number) => {
+        ctx.phase.value = 'PDF 生成中';
+        ctx.completed_count.value = 0;
+        ctx.total_count.value = total;
+      },
+      'export:write:progress': (index: number) => {
+        ctx.completed_count.value = index;
+      },
+    }),
+  },
+};
+
+export default (opts: { serverOutputDir?: string; mdImageMode?: Ref<'indexed' | 'base64' | 'cdn'> } = {}) => {
   const toast = toastFactory();
 
   const loading = ref(false);
@@ -11,305 +171,64 @@ export default () => {
   const completed_count = ref(0);
   const total_count = ref(0);
 
-  // 导出 excel
-  async function export2excel(urls: string[]) {
+  function createExporter(urls: string[]) {
+    const exporter = new Exporter(urls);
+    if (opts.serverOutputDir) {
+      exporter.serverOutputDir = opts.serverOutputDir;
+    }
+    if (opts.mdImageMode) {
+      exporter.mdImageMode = opts.mdImageMode.value;
+    }
+    return exporter;
+  }
+
+  async function runExport(type: ExportType, urls: string[]): Promise<FileExportQueueResult | undefined> {
     if (urls.length === 0) {
       toast.warning('提示', '请先选择文章');
       return;
     }
 
-    const manager = new Exporter(urls);
-    manager.on('export:begin', () => {
-      phase.value = '导出中';
-      completed_count.value = 0;
-      total_count.value = 0;
-    });
-    manager.on('export:total', (total: number) => {
-      total_count.value = total;
-    });
-    manager.on('export:progress', (num: number) => {
-      completed_count.value = num;
-    });
+    const config = EXPORT_CONFIGS[type];
+    const manager = createExporter(urls);
+
+    const eventHandlers = config.events({ phase, completed_count, total_count });
+    for (const [event, handler] of Object.entries(eventHandlers)) {
+      manager.on(event, handler);
+    }
+    let elapsedText = '';
     manager.on('export:finish', (seconds: number) => {
-      console.debug('耗时:', formatElapsedTime(seconds));
-      toast.success('Excel 导出完成', `本次导出耗时 ${formatElapsedTime(seconds)}`);
+      elapsedText = formatElapsedTime(seconds);
+      console.debug('耗时:', elapsedText);
     });
 
     try {
       loading.value = true;
-      await manager.startExport('excel');
+      const result = await manager.startExport(type);
+      toast.success(`${config.label} 导出完成`, `本次导出耗时 ${elapsedText}`);
+      return result;
     } catch (error) {
       console.error('导出任务失败:', error);
       alert((error as Error).message);
+      throw error;
     } finally {
       loading.value = false;
     }
   }
 
-  // 导出 json
-  async function export2json(urls: string[]) {
-    if (urls.length === 0) {
-      toast.warning('提示', '请先选择文章');
-      return;
-    }
-
-    const manager = new Exporter(urls);
-    manager.on('export:begin', () => {
-      phase.value = '导出中';
-      completed_count.value = 0;
-      total_count.value = 0;
-    });
-    manager.on('export:total', (total: number) => {
-      total_count.value = total;
-    });
-    manager.on('export:progress', (num: number) => {
-      completed_count.value = num;
-    });
-    manager.on('export:finish', (seconds: number) => {
-      console.debug('耗时:', formatElapsedTime(seconds));
-      toast.success('Json 导出完成', `本次导出耗时 ${formatElapsedTime(seconds)}`);
-    });
-
-    try {
-      loading.value = true;
-      await manager.startExport('json');
-    } catch (error) {
-      console.error('导出任务失败:', error);
-      alert((error as Error).message);
-    } finally {
-      loading.value = false;
-    }
-  }
-
-  // 导出 html
-  async function export2html(urls: string[]) {
-    if (urls.length === 0) {
-      toast.warning('提示', '请先选择文章');
-      return;
-    }
-
-    const manager = new Exporter(urls);
-    manager.on('export:begin', () => {
-      phase.value = '资源解析中';
-      completed_count.value = 0;
-      total_count.value = 0;
-    });
-    manager.on('export:download', (total: number) => {
-      phase.value = '资源下载中';
-      completed_count.value = 0;
-      total_count.value = total;
-    });
-    manager.on('export:download:progress', (url: string, success: boolean, status: ExporterStatus) => {
-      completed_count.value = status.completed.length;
-    });
-    manager.on('export:write', (total: number) => {
-      phase.value = '文件写入中';
-      completed_count.value = 0;
-      total_count.value = total;
-    });
-    manager.on('export:write:progress', (index: number) => {
-      completed_count.value = index;
-    });
-    manager.on('export:finish', (seconds: number) => {
-      console.debug('耗时:', formatElapsedTime(seconds));
-      toast.success('HTML 导出完成', `本次导出耗时 ${formatElapsedTime(seconds)}`);
-    });
-
-    try {
-      loading.value = true;
-      await manager.startExport('html');
-    } catch (error) {
-      console.error('导出任务失败:', error);
-      alert((error as Error).message);
-    } finally {
-      loading.value = false;
-    }
-  }
-
-  // 导出 txt
-  async function export2txt(urls: string[]) {
-    if (urls.length === 0) {
-      toast.warning('提示', '请先选择文章');
-      return;
-    }
-
-    const manager = new Exporter(urls);
-    manager.on('export:begin', () => {
-      phase.value = '资源解析中';
-      completed_count.value = 0;
-      total_count.value = 0;
-    });
-    manager.on('export:total', (total: number) => {
-      phase.value = '导出中';
-      completed_count.value = 0;
-      total_count.value = total;
-    });
-    manager.on('export:progress', (index: number) => {
-      completed_count.value = index;
-    });
-    manager.on('export:finish', (seconds: number) => {
-      console.debug('耗时:', formatElapsedTime(seconds));
-      toast.success('Txt 导出完成', `本次导出耗时 ${formatElapsedTime(seconds)}`);
-    });
-
-    try {
-      loading.value = true;
-      await manager.startExport('txt');
-    } catch (error) {
-      console.error('导出任务失败:', error);
-      alert((error as Error).message);
-    } finally {
-      loading.value = false;
-    }
-  }
-
-  // 导出 markdown
-  async function export2markdown(urls: string[]) {
-    if (urls.length === 0) {
-      toast.success('提示', '请先选择文章');
-      return;
-    }
-
-    const manager = new Exporter(urls);
-    manager.on('export:begin', () => {
-      phase.value = '资源解析中';
-      completed_count.value = 0;
-      total_count.value = 0;
-    });
-    manager.on('export:total', (total: number) => {
-      phase.value = '导出中';
-      completed_count.value = 0;
-      total_count.value = total;
-    });
-    manager.on('export:progress', (index: number) => {
-      completed_count.value = index;
-    });
-    manager.on('export:finish', (seconds: number) => {
-      console.debug('耗时:', formatElapsedTime(seconds));
-      toast.success('Markdown 导出完成', `本次导出耗时 ${formatElapsedTime(seconds)}`);
-    });
-
-    try {
-      loading.value = true;
-      await manager.startExport('markdown');
-    } catch (error) {
-      console.error('导出任务失败:', error);
-      alert((error as Error).message);
-    } finally {
-      loading.value = false;
-    }
-  }
-
-  // 导出 word
-  async function export2word(urls: string[]) {
-    if (urls.length === 0) {
-      toast.warning('提示', '请先选择文章');
-      return;
-    }
-
-    const manager = new Exporter(urls);
-    manager.on('export:begin', () => {
-      phase.value = '资源解析中';
-      completed_count.value = 0;
-      total_count.value = 0;
-    });
-    manager.on('export:total', (total: number) => {
-      phase.value = '导出中';
-      completed_count.value = 0;
-      total_count.value = total;
-    });
-    manager.on('export:progress', (index: number) => {
-      completed_count.value = index;
-    });
-    manager.on('export:finish', (seconds: number) => {
-      console.debug('耗时:', formatElapsedTime(seconds));
-      toast.success('Word 导出完成', `本次导出耗时 ${formatElapsedTime(seconds)}`);
-    });
-
-    try {
-      loading.value = true;
-      await manager.startExport('word');
-    } catch (error) {
-      console.error('导出任务失败:', error);
-      alert((error as Error).message);
-    } finally {
-      loading.value = false;
-    }
-  }
-
-  // 导出 pdf（与 HTML 导出类似，需先下载资源再生成 PDF）
-  async function export2pdf(urls: string[]) {
-    if (urls.length === 0) {
-      toast.warning('提示', '请先选择文章');
-      return;
-    }
-
-    const manager = new Exporter(urls);
-    manager.on('export:begin', () => {
-      phase.value = '资源解析中';
-      completed_count.value = 0;
-      total_count.value = 0;
-    });
-    manager.on('export:download', (total: number) => {
-      phase.value = '资源下载中';
-      completed_count.value = 0;
-      total_count.value = total;
-    });
-    manager.on('export:download:progress', (url: string, success: boolean, status: ExporterStatus) => {
-      completed_count.value = status.completed.length;
-    });
-    manager.on('export:write', (total: number) => {
-      phase.value = 'PDF 生成中';
-      completed_count.value = 0;
-      total_count.value = total;
-    });
-    manager.on('export:write:progress', (index: number) => {
-      completed_count.value = index;
-    });
-    manager.on('export:finish', (seconds: number) => {
-      console.debug('耗时:', formatElapsedTime(seconds));
-      toast.success('PDF 导出完成', `本次导出耗时 ${formatElapsedTime(seconds)}`);
-    });
-
-    try {
-      loading.value = true;
-      await manager.startExport('pdf');
-    } catch (error) {
-      console.error('导出任务失败:', error);
-      alert((error as Error).message);
-    } finally {
-      loading.value = false;
-    }
-  }
-
-  const needsContentFormats = new Set(['html', 'text', 'markdown', 'word', 'pdf']);
+  const needsContentFormats = new Set<string>(['html', 'text', 'markdown', 'word', 'pdf']);
 
   function exportFile(
     type: 'excel' | 'json' | 'html' | 'text' | 'markdown' | 'word' | 'pdf',
     urls: string[],
-    contentNotDownloadedCount?: number,
+    contentNotDownloadedCount?: number
   ) {
     if (needsContentFormats.has(type) && contentNotDownloadedCount) {
-      toast.warning('提示', `有 ${contentNotDownloadedCount} 篇文章尚未抓取内容，请先抓取内容后再导出`);
+      toast.warning('提示', `有 ${contentNotDownloadedCount} 篇文章尚未缓存正文，请先缓存正文后再导出`);
       return;
     }
 
-    switch (type) {
-      case 'excel':
-        return export2excel(urls);
-      case 'json':
-        return export2json(urls);
-      case 'html':
-        return export2html(urls);
-      case 'text':
-        return export2txt(urls);
-      case 'markdown':
-        return export2markdown(urls);
-      case 'word':
-        return export2word(urls);
-      case 'pdf':
-        return export2pdf(urls);
-    }
+    const exportType: ExportType = type === 'text' ? 'txt' : type;
+    return runExport(exportType, urls);
   }
 
   return {

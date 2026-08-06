@@ -12,7 +12,7 @@
             <template #panel>
               <p class="max-w-[300px] p-3 text-sm text-gray-500">
                 是否在文章下载表格中显示已删除的文章。<br />
-                若勾选该选项，则文章下载表格将过滤掉已经被删除的文章(无论文章内容是否已被下载)。
+                若勾选该选项，则文章下载表格将过滤掉已经被删除的文章(无论文章正文是否已缓存)。
               </p>
             </template>
             <UIcon color="gray" name="i-heroicons:question-mark-circle-16-solid" class="size-5" />
@@ -23,13 +23,13 @@
           <UCheckbox
             v-model="preferences.downloadConfig.forceDownloadContent"
             name="forceDownloadContent"
-            label="强制下载文章内容"
+            label="强制刷新正文缓存"
           />
           <UPopover mode="hover" :popper="{ placement: 'top' }">
             <template #panel>
               <p class="max-w-[300px] p-3 text-sm text-gray-500">
-                在抓取文章内容时，若该文章内容已被下载，则会跳过抓取过程。<br />
-                若勾选该选项，则会忽略已缓存内容，强制重新下载最新文章内容。<br />
+                在缓存文章正文时，若该文章正文已被缓存，则会跳过缓存过程。<br />
+                若勾选该选项，则会忽略已缓存正文，强制重新下载最新文章正文。<br />
               </p>
             </template>
             <UIcon color="gray" name="i-heroicons:question-mark-circle-16-solid" class="size-5" />
@@ -40,13 +40,13 @@
           <UCheckbox
             v-model="preferences.downloadConfig.metadataOverrideContent"
             name="metadataOverrideContent"
-            label="抓取阅读量时是否覆盖文章内容"
+            label="同步阅读量时覆盖正文缓存"
           />
           <UPopover mode="hover" :popper="{ placement: 'top' }">
             <template #panel>
               <p class="max-w-[300px] p-3 text-sm text-gray-500">
-                在抓取阅读量时，会同时下载文章内容。<br />
-                若勾选该选项，则文章内容会同时保存到缓存中(会占用一定的存储空间)。
+                在同步阅读量时，会同时下载文章正文。<br />
+                若勾选该选项，则文章正文会同时保存到缓存中(会占用一定的存储空间)。
               </p>
             </template>
             <UIcon color="gray" name="i-heroicons:question-mark-circle-16-solid" class="size-5" />
@@ -60,9 +60,9 @@
             <UPopover mode="hover" :popper="{ placement: 'top' }">
               <template #panel>
                 <p class="max-w-[300px] p-3 text-sm text-gray-500">
-                  在同步公众号文章数据时，程序会自动抓取该公众号的所有文章，直到所有数据同步完成。<br />
-                  该选项用于控制抓取频率，比如设置为 5
-                  就表示每五秒抓取一次。该数据越小，同步的越快，但是容易被封号。推荐不小于3
+                  在同步公众号文章列表时，程序会自动请求该公众号的所有文章列表，直到所有数据同步完成。<br />
+                  该选项用于控制同步间隔，比如设置为 5
+                  就表示每五秒同步一次。该数据越小，同步的越快，但是容易被封号。推荐不小于3
                 </p>
               </template>
               <UIcon color="gray" name="i-heroicons:question-mark-circle-16-solid" class="size-5" />

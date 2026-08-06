@@ -7,7 +7,7 @@ const defaultOptions: Partial<Preferences> = {
   privateProxyList: [],
   privateProxyAuthorization: '',
   exportConfig: {
-    dirname: '${title}',
+    dirname: '${account}/${title}',
     maxlength: 0,
     exportExcelIncludeContent: true,
     exportJsonIncludeComments: true,

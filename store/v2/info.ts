@@ -24,11 +24,14 @@ export interface MpAccount {
  * 更新 account 缓存
  * @param mpAccount
  */
-export async function updateInfoCache(mpAccount: MpAccount): Promise<boolean> {
+export async function updateInfoCache(
+  mpAccount: MpAccount,
+  options: { replaceCompletion?: boolean } = {}
+): Promise<boolean> {
   return db.transaction('rw', 'info', async () => {
     let infoCache = await db.info.get(mpAccount.fakeid);
     if (infoCache) {
-      if (mpAccount.completed) {
+      if (options.replaceCompletion || mpAccount.completed) {
         infoCache.completed = mpAccount.completed;
       }
       infoCache.count += mpAccount.count;

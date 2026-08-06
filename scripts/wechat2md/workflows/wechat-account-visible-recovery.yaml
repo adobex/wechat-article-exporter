@@ -1,0 +1,131 @@
+version: 1
+workflow_id: wechat-account-visible-recovery
+purpose: Recover recent or historical articles for any single WeChat public account with stable identity, without relying on a hard-coded account catalog.
+
+scope:
+  account_count: exactly one account per invocation
+  account_policy: Accept any account name plus a validated stable biz. Product-analysis accounts are ordinary inputs, not a special branch.
+  coverage: partial
+  state_policy: Partial local, WeRead, and public-index results never advance a complete-sync watermark or integrity-audit timestamp.
+
+inputs:
+  account_name: Required current display name from the public-account manager or verified article evidence.
+  stable_biz: Required canonical base64 __biz identity for the selected account.
+  account_aliases: Optional prior display names used only as discovery hints; accepted articles must still match stable_biz.
+  publish_date_floor: Required YYYY-MM-DD boundary in Asia/Shanghai.
+  output_root: /Users/adobe/Project/output/WechatArticles
+
+resource_resolution:
+  command: node scripts/wechat2md/account_resource.mjs --account-name <account_name> --stable-biz <stable_biz> --output-root /Users/adobe/Project/output/WechatArticles
+  required_fields:
+    - resourceKey
+    - outputDir
+    - leaseFile
+    - stateFile
+    - runCatalogTemplate
+    - runEvidenceTemplate
+  identity_rule: resourceKey, leaseFile, and stateFile are derived from stable_biz, so an account rename keeps the same ownership boundary.
+  output_rule: outputDir is derived from the validated current account name and must remain below output_root.
+
+account_lease:
+  acquire_command: python3 scripts/wechat2md/automation_lease.py acquire --lease-file <leaseFile> --workflow-id wechat-account-visible-recovery --owner-token <owner_token> --ttl-seconds 3600
+  heartbeat_command: python3 scripts/wechat2md/automation_lease.py heartbeat --lease-file <leaseFile> --owner-token <owner_token> --ttl-seconds 3600 --interval-seconds 300 --max-lifetime-seconds 43200 --quiet
+  busy_policy: Stop this account as busy. Never replace, delete, or take over another owner's lease.
+  failure_policy: Stop before another browser action, download, or state write when renewal fails.
+  finally_release: Always release leaseFile in finally with the same owner_token.
+
+service:
+  origin: http://localhost:3000/
+  start_command: WECHAT2MD_LOCAL_OUTPUT_ENABLED=true WECHAT2MD_OUTPUT_DIR=/Users/adobe/Project/output/WechatArticles yarn dev --host localhost --port 3000
+  readiness_command: curl --fail --silent --show-error http://localhost:3000/api/local/wechat2md/credentials | jq -e '.success == true and .outputDir == "/Users/adobe/Project/output/WechatArticles"'
+  origin_rule: Use localhost, never 127.0.0.1, because browser IndexedDB is origin-scoped.
+
+source_priority:
+  dashboard_refresh:
+    - reconcile every canonical local record for stable_biz, including records written under a prior account name
+    - continue to the bounded public index even when local records already exist
+    - use authenticated complete sources only as a final probe when local and public sources are unavailable
+  host_acquisition:
+    - normal_chrome_visible_weread
+    - public_index_fallback
+    - authenticated_complete_source_probe
+  blocked_source_rule: A source already known to return frequency control is never the first request of a new refresh or host recovery run.
+
+normal_chrome_visible_weread:
+  trigger: Default host acquisition source whenever the user's existing normal Chrome is connected and signed in to WeRead.
+  reader_url_command: node scripts/wechat2md/weread_reader_url.mjs --stable-biz <stable_biz>
+  browser_policy: Reuse only the user's already-open normal Google Chrome. Do not open a dedicated profile, another browser, PC WeChat, a system proxy, a trusted certificate, browser storage, exported cookies, or a private JSON list endpoint.
+  login_policy: Stop with login_required, captcha_required, or existing_chrome_unavailable when user action is needed; never switch browsers.
+  directory_scan: Open the helper-produced reader URL, verify the rendered heading against account_name or an explicit alias, open the visible directory, and physically scroll until an entry older than publish_date_floor is rendered.
+  lazy_load_guard: Record initialDirectoryEntries, scrollSteps, directoryEntriesLoaded, and oldestLoadedDate. The initial batch is never treated as full coverage unless it already crosses the date boundary.
+  catalog_snapshot: Write the complete ordered visible catalog to the runCatalogTemplate path owned by the current run.
+  article_evidence: Open each missing visible entry and write title, rendered date, canonical og:url, biz, mid, and idx to runEvidenceTemplate. Require stable_biz, positive mid and idx, exact title/date, and nonempty rendered body.
+  audit_command: node scripts/wechat2md/weread_catalog_audit.mjs --catalog <runCatalogTemplate> --account-dir <outputDir> --output <run_dir>/<resourceKey>-weread-audit.json
+  recovery_command: node scripts/wechat2md/visible_catalog_recovery.mjs --account-name <account_name> --stable-biz <stable_biz> --catalog <runCatalogTemplate> --official-articles <runEvidenceTemplate> --run-dir <run_dir> --owner-token <owner_token> --output-root /Users/adobe/Project/output/WechatArticles --service-origin http://localhost:3000 --apply-url-repairs true
+  recovery_contract: The executable helper rechecks active lease ownership and localhost output-root readiness, validates every required visible article evidence record, downloads only audit-confirmed missing entries, writes only successful current-run index.md files to files.json, backs up any identity-free short-link repair, and reruns the catalog and canonical-URL gates. A second run with unchanged inputs must be an empty successful no-op.
+  reconciliation_gate: Require missing=0, ambiguous=0, localReadErrors=0, dateMismatches=0, urlIdentityMismatches=0, and officialUrlEvidenceErrors=0 after bounded recovery and any explicit backed-up repair.
+
+public_index_fallback:
+  endpoint: POST /api/local/public-article-discovery
+  request: Pass accountName=account_name, expectedBiz=stable_biz, and notBefore=publish_date_floor.
+  request_timeout_seconds: 15
+  empty_result_retry: When a successful bounded scan has no exact in-range candidate, repeat the primary query's first page once before reporting a partial zero-result.
+  acceptance: Accept only exact stable_biz plus positive mid and idx, valid publication time, exact source-account evidence, and nonempty article body.
+  coverage: partial
+  zero_result_policy: A verified zero-result response is a partial no-op, never proof of complete history.
+
+authenticated_complete_source_probe:
+  endpoints:
+    - /api/web/mp/appmsgpublish
+    - /api/local/wechat2md/article-list
+  trigger: Last resort only after preferred sources are unavailable and current source-health evidence does not already mark the authenticated path frequency controlled.
+  request_policy: Use the shared authenticated API lease and bounded frequency-control handling from mp_api_request.py.
+  success_policy: Only a fully paginated, overlap-complete or date-floor-complete probe may update complete-sync state.
+
+download:
+  endpoint: POST /api/local/wechat2md
+  body:
+    url: canonical og:url from verified article evidence
+    canonicalUrl: same canonical og:url
+    accountName: account_name
+    expectedBiz: stable_biz
+    outputDir: output_root
+    mode: lite
+    imageMode: cdn
+  existing_content_policy: Never delete an existing article directory or images directory. Reconcile by canonical stable identity.
+
+dashboard_reconciliation:
+  page: http://localhost:3000/dashboard/account
+  action: Refresh the exact account row after downloads. The page first reconciles local canonical records, then runs bounded public discovery.
+  identity: A current or historical account name may nominate a record, but only matching stable_biz plus positive mid and idx and a valid publication date may enter IndexedDB.
+  completion_policy: Local and public results set completed=false and never update the complete-sync timestamp.
+  idempotency: A second reconciliation with unchanged inputs must add zero articles and zero messages.
+
+report:
+  required_fields:
+    - account_name
+    - stable_biz
+    - resource_key
+    - lease_status
+    - source_order_attempted
+    - local_canonical_records
+    - local_recovered_articles
+    - local_rejected_records
+    - weread_initial_directory_entries
+    - weread_directory_entries_loaded
+    - weread_scroll_steps
+    - weread_boundary_reached
+    - public_index_verified_articles
+    - complete_source_probe_status
+    - downloaded_index_files
+    - dashboard_recovered_articles
+    - dashboard_completion_state
+    - warnings
+
+forbidden:
+  - hard-code a target-account allowlist in the generic workflow or Dashboard refresh path
+  - claim that the Dashboard launched or controlled Chrome
+  - treat an old local record as a reason to skip discovery of newer articles
+  - use mtime as a canonical publication date
+  - preserve completed=true after writing partial-source records
+  - run Steam import, product analysis, product KB import, or a full-library rebuild

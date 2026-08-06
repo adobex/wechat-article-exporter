@@ -10,17 +10,10 @@
 </template>
 
 <script setup lang="ts">
-import { ModuleRegistry } from 'ag-grid-community';
-import { AllEnterpriseModule, LicenseManager } from 'ag-grid-enterprise';
 import { isDev } from '~/config';
-import { isChromeBrowser } from '~/utils';
+import { isSupportedChromeBrowser } from '~/utils/browser';
 
-const runtimeConfig = useRuntimeConfig();
-
-ModuleRegistry.registerModules([AllEnterpriseModule]);
-LicenseManager.setLicenseKey(runtimeConfig.public.aggridLicense);
-
-if (!isChromeBrowser()) {
+if (!isSupportedChromeBrowser()) {
   alert('为了更好的用户体验，推荐使用 Chrome 浏览器。');
 }
 </script>

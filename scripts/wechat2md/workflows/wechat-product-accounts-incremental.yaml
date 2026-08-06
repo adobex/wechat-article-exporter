@@ -1,0 +1,406 @@
+version: 14
+id: wechat-product-accounts-incremental
+updated_at: "2026-08-05"
+owner_project: wechat-article-exporter
+purpose: >
+  Incrementally sync selected WeChat public accounts, download newly missing
+  articles from 2025 onward as lite Markdown with CDN image links, then run the
+  existing WeChat article product distillation and product-oriented KB import
+  workflow.
+
+generic_account_recovery:
+  canonical_entry: /Users/adobe/Project/tools/wechat-article-exporter/scripts/wechat2md/workflows/wechat-account-visible-recovery.yaml
+  relationship: Each account below is one concrete input to the generic stable-biz resource and visible-recovery contract; this product workflow adds only its three-account batch scope, product analysis, receipt, import, and atomic state gates.
+  generic_scope_rule: Do not infer that the tool supports only the accounts in this file. Any other account uses the generic workflow directly and never enters this workflow's product-analysis manifest unless explicitly added here.
+
+run_identity:
+  helper: /Users/adobe/Project/tools/wechat-article-exporter/scripts/wechat2md/run_artifact.py
+  owner_token_rule: Generate and retain one full UUID per run; never truncate it.
+  artifact_root: /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-runs
+  reserve_command: python3 scripts/wechat2md/run_artifact.py --root <artifact_root> --workflow-id wechat-product-accounts-incremental --owner-token <owner_token>
+  rule: Use the helper's atomically reserved YYYYMMDDTHHMMSSZ-<full-owner-UUID> run_id and run_dir for every current-run artifact.
+  collision_policy: The helper retries an atomic directory reservation on collision; never construct or reuse a date-only artifact path.
+
+account_leases:
+  helper: /Users/adobe/Project/tools/wechat-article-exporter/scripts/wechat2md/automation_lease.py
+  path_template: /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-state/leases/accounts/<account.state_key>.json
+  ttl_seconds: 3600
+  owner_token_policy: Retain the run owner token in process memory and use it for every account lease acquired by this run.
+  acquire_command: python3 scripts/wechat2md/automation_lease.py acquire --lease-file <account.lease_file> --workflow-id wechat-product-accounts-incremental:<account.state_key> --owner-token <owner_token> --ttl-seconds 3600
+  busy_policy: Record the busy account as skipped and continue with other accounts; never release a lease owned by another token.
+  held_scope: Hold each acquired account lease across that account's scan/download plus the shared manifest, analysis, formal product import, verification, and that account's state update.
+  heartbeat_command: python3 scripts/wechat2md/automation_lease.py heartbeat --lease-file <account.lease_file> --owner-token <owner_token> --ttl-seconds 3600 --interval-seconds 300 --max-lifetime-seconds 43200 --quiet
+  heartbeat_policy: Start and monitor one heartbeat per acquired account lease. If any heartbeat exits, reaches its 12-hour maximum lifetime, or owner-checked renewal fails, stop before further download, --confirm, or state writes for that account.
+  finally_release: In a finally block, release every acquired account lease with the same owner token on success, failure, cancellation, or partial execution.
+  release_command: python3 scripts/wechat2md/automation_lease.py release --lease-file <account.lease_file> --owner-token <owner_token>
+
+service_startup_lease:
+  helper: /Users/adobe/Project/tools/wechat-article-exporter/scripts/wechat2md/automation_lease.py
+  lease_file: /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-state/leases/services/wechat2md-localhost-3000.json
+  ttl_seconds: 180
+  scope: Protect only the healthcheck/recheck/startup transition for the shared localhost service; never hold this lease during scan, download, analysis, or import.
+  procedure: Run the local-API readiness check first. If ready, reuse the service without acquiring this lease. If not ready, acquire, check again, and inspect the root listener before starting. Start only when localhost:3000 has no incompatible listener, then release immediately after readiness succeeds.
+  busy_policy: When another run owns the startup lease, poll the localhost healthcheck within the startup TTL; do not stop account processing merely because service startup is already in progress.
+  incompatible_listener_policy: If the root origin responds but the local-API readiness check fails, record service_incompatible and stop before authenticated scans or downloads; never kill, replace, or reuse that listener.
+  shutdown_policy: Treat localhost:3000 as a shared singleton and do not stop it automatically at workflow completion.
+
+authenticated_api_lease:
+  helper: /Users/adobe/Project/tools/wechat-article-exporter/scripts/wechat2md/automation_lease.py
+  request_helper: /Users/adobe/Project/tools/wechat-article-exporter/scripts/wechat2md/mp_api_request.py
+  lease_file: /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-state/leases/api/wechat-mp-session.json
+  ttl_seconds: 300
+  request_timeout_seconds: 30
+  local_proxy_timeout_seconds: 25
+  post_response_cooldown_seconds: 2
+  backoff_seconds:
+    - 30
+    - 60
+    - 120
+  scope: Serialize only authenticated /api/web/mp/searchbiz, /api/web/mp/appmsgpublish, and local profile_ext fallback requests that reach WeChat; downloads, analysis, and imports never hold this lease.
+  command_template: python3 scripts/wechat2md/mp_api_request.py --lease-file <lease_file> --owner-token <owner_token> --workflow-id wechat-product-accounts-incremental:wechat-mp-api --lease-ttl-seconds 300 --wait-timeout-seconds 300 --request-timeout-seconds 30 --cooldown-seconds 2 --backoff-seconds 30,60,120 -- <curl request>
+  request_policy: Every authenticated request must run through request_helper, which holds the API lease through the response and the full 2-second post-response cooldown before owner-checked release.
+  timeout_policy: The localhost MP proxy starts its 25-second budget at proxy entry, aborts the upstream WeChat fetch before request_helper's 30-second client timeout, and refuses to start upstream work when the client already disconnected during token or cookie lookup.
+  busy_policy: Wait and retry this request when another workflow owns the API lease; never skip an account merely because the shared session is in use.
+  frequency_control_policy: request_helper renews before every request, cooldown, and 30/60/120-second backoff; owner loss stops the request, and the 300-second TTL exceeds one 30-second request plus the longest pause and safety margin.
+
+concurrency:
+  model: different_accounts_parallel_same_account_serial
+  safe_parallel_with:
+    - indienova-steam-incremental
+  scan_request_policy: Use authenticated_api_lease so only the shared-session requests are serialized and rate-limited; per-account reconciliation, downloads, and imports remain independent.
+  import_policy: Product confirm writes remain serialized only inside batch-products-structured-import.py by its structured-ai-products writer lock; scans, downloads, dry-runs, and Steam imports do not use that lock.
+
+sync_state:
+  scope: one_file_per_account
+  path_template: /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-state/accounts/<account.state_key>.json
+  legacy_read_fallback: /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-state/wechat-product-accounts-incremental.json
+  migration: When an account state is absent, first read account.legacy_state_path, then only that account's entry from legacy_read_fallback. Leave both legacy sources untouched and publish the stable-biz state_path only after the account's fully verified batch succeeds.
+  persistence: Write a temporary JSON file and atomically replace the state file only after the whole leased workflow and its verification succeed.
+  per_account_schema:
+    high_watermark_publish_timestamp: newest successfully reconciled publish timestamp
+    high_watermark_article_ids: article ids observed at that timestamp
+    last_successful_run_at: ISO-8601 timestamp
+    last_integrity_audit_at: ISO-8601 timestamp
+    last_integrity_audit_date_floor: "2025-01-01"
+  failure_policy: Keep the previous per-account state unchanged when any download, analysis, receipt, import, or verification step fails.
+
+service:
+  cwd: /Users/adobe/Project/tools/wechat-article-exporter
+  origin: http://localhost:3000/
+  start_command: WECHAT2MD_LOCAL_OUTPUT_ENABLED=true WECHAT2MD_OUTPUT_DIR=/Users/adobe/Project/output/WechatArticles yarn dev --host localhost --port 3000
+  root_healthcheck_command: curl --fail --silent --show-error --head http://localhost:3000/
+  healthcheck_command: curl --fail --silent --show-error http://localhost:3000/api/local/wechat2md/credentials | jq -e '.success == true and .outputDir == "/Users/adobe/Project/output/WechatArticles"'
+  readiness_contract: Require HTTP 200, JSON success=true, and outputDir exactly equal to required_output_root. A healthy root page or a local API bound to another output root is incompatible.
+  output_root_env: WECHAT2MD_OUTPUT_DIR
+  required_output_root: /Users/adobe/Project/output/WechatArticles
+  origin_rule: Do not use http://127.0.0.1:3000/ because browser IndexedDB is origin-scoped.
+  lifecycle: Shared singleton coordinated by service_startup_lease; reuse an already healthy service.
+
+auth:
+  mode: existing_session_with_ephemeral_profile_fallback
+  auth_key_source: local cookie store used by wechat-article-exporter
+  request_header: X-Auth-Key
+  chrome_policy: Reuse the user's already-open normal Google Chrome only for relogin or the official WeRead visible-page fallback. Never launch a dedicated or alternate browser profile.
+  credential_policy: Do not invent, persist, log, or replace credentials. The optional profile_ext fallback may use only fresh Credentials already synchronized by the localhost dashboard into process memory. The WeRead fallback uses host Chrome control against the already-rendered official reader page without reading or exporting cookies, tickets, browser storage, or profile files. Partial sources never complete an audit or advance sync state.
+  profile_credential_cache:
+    sync_endpoint: POST /api/local/wechat2md/credentials
+    status_endpoint: GET /api/local/wechat2md/credentials
+    storage: process_memory_only
+    maximum_age_minutes: 25
+    secret_exposure: Status responses contain only biz, optional nickname, capturedAt, and expiresAt; key, pass_ticket, cookie, uin, and appmsg_token are never returned.
+    origin_policy: Credential synchronization is enabled only for the localhost origin while WECHAT2MD_LOCAL_OUTPUT_ENABLED=true and a non-empty WECHAT2MD_OUTPUT_DIR is configured.
+
+accounts:
+  - name: 游戏吗喽说
+    stable_biz: MzkyMDcyNTEyNA==
+    state_key: wechat-account-98358f377fae9cfdde83
+    state_path: /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-state/accounts/wechat-account-98358f377fae9cfdde83.json
+    legacy_state_path: /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-state/accounts/product-youxi-malou-shuo.json
+    lease_file: /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-state/leases/accounts/wechat-account-98358f377fae9cfdde83.json
+    search_keyword: 游戏吗喽说
+    output_dir: /Users/adobe/Project/output/WechatArticles/游戏吗喽说
+  - name: 新游观察
+    stable_biz: MzkyMzY2OTc5Mw==
+    state_key: wechat-account-b32f5809900e0e3e9ab9
+    state_path: /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-state/accounts/wechat-account-b32f5809900e0e3e9ab9.json
+    legacy_state_path: /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-state/accounts/product-xinyou-guancha.json
+    lease_file: /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-state/leases/accounts/wechat-account-b32f5809900e0e3e9ab9.json
+    search_keyword: 新游观察
+    output_dir: /Users/adobe/Project/output/WechatArticles/新游观察
+  - name: 王董的新游戏
+    stable_biz: Mzg5MTcwMTI5Nw==
+    state_key: wechat-account-f6997a8037821025d30b
+    state_path: /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-state/accounts/wechat-account-f6997a8037821025d30b.json
+    legacy_state_path: /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-state/accounts/product-wangdong-xinyouxi.json
+    lease_file: /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-state/leases/accounts/wechat-account-f6997a8037821025d30b.json
+    search_keyword: 王董的新游戏
+    output_dir: /Users/adobe/Project/output/WechatArticles/王董的新游戏
+
+article_scan:
+  source_priority:
+    preferred_acquisition: Reuse the user's normal Chrome and the rendered WeRead catalog first for every account in this workflow; reconcile any already-downloaded canonical local records before making a network list request.
+    routine_order:
+      - local_canonical_export_reconciliation
+      - weread_chrome_fallback
+      - public_index_fallback
+    complete_source_probe: appmsgpublish and profile_ext are completeness probes only. Do not call them before the preferred acquisition path when the session is already known to return frequency control; a successful complete probe may still advance state under the existing gates.
+    dashboard_rule: The public-account manager follows generic_account_recovery.canonical_entry for every account. It reconciles canonical local records and then continues bounded public discovery even when old local records exist; authenticated complete sources are a final probe only when preferred sources are unavailable.
+  complete_probe_endpoint: /api/web/mp/appmsgpublish
+  profile_ext_fallback:
+    endpoint: /api/local/wechat2md/article-list
+    trigger: Use only as an explicit complete-source probe after local/WeRead acquisition, or when the preferred visible-page source is unavailable and current source-health evidence does not already mark the authenticated list path frequency controlled.
+    credential_preflight: Query GET /api/local/wechat2md/credentials and require a fresh entry whose biz exactly matches the selected account fakeid; never send Credential secrets from the automation request.
+    request_policy: Run every fallback page request through authenticated_api_lease because the local endpoint still reaches WeChat. Pass only id, begin, and size to localhost.
+    response_contract: Require source=profile_ext, base_resp.ret=0, articles as a normalized flat list, can_continue, and next_offset. The adapter expands primary and multi_app_msg_item_list entries, rejects deleted entries and non-mp.weixin.qq.com links, and derives stable aid values from mid plus idx.
+    pagination: Start at begin=0, then use next_offset while can_continue=true. Apply the same high-watermark, dynamic overlap, integrity audit, date floor, and local index.md reconciliation rules as the appmsgpublish complete probe.
+    maximum_pages_per_account: 500
+    progress_guard: Track every requested offset and a SHA256 signature of each page's ordered canonical aid/link list. Require next_offset to be greater than the current offset and previously unseen; stop the account on a repeated offset, repeated page signature, or page-limit breach.
+    progress_failure_policy: Treat any progress-guard breach as a scan failure, preserve the previous per-account sync state, and do not continue requesting pages.
+    unavailable_policy: If the matching Credential is absent or expired, or fallback returns a nonzero ret including frequency control, continue to weread_chrome_fallback. Preserve the previous per-account sync state regardless of partial-source results.
+    source_consistency: A complete-source probe may switch from appmsgpublish to profile_ext, but high-watermark identity remains publish timestamp plus canonical aid; never merge duplicate links twice.
+  weread_chrome_fallback:
+    trigger: Use as the default discovery and acquisition source for the workflow accounts whenever the user's normal Chrome is available and signed in; do not wait for appmsgpublish or profile_ext to fail first.
+    reader_url_helper: node scripts/wechat2md/weread_reader_url.mjs --stable-biz <account.stable_biz>
+    browser_policy: Reuse the user's already-open, signed-in normal Google Chrome through host Chrome control. Do not launch a dedicated profile or another browser, do not take over the PC WeChat client, and do not use a system proxy, trusted certificate, browser-cache extraction, exported cookies, copied x-wr-ticket, raw CDP, or private JSON endpoint navigation.
+    login_policy: If normal Chrome is unavailable, not connected to host control, or not signed in at https://weread.qq.com, stop that account with existing_chrome_unavailable or login_required. Never open an alternate browser and never bypass a CAPTCHA; stop and report captcha_required.
+    identity_policy: Derive bookId and the official reader URL only with reader_url_helper. Require the rendered reader heading to equal account.name and accept only article URLs whose host is mp.weixin.qq.com and whose __biz exactly equals account.stable_biz.
+    directory_scan: Open the helper-produced official reader URL in a background tab of the existing Chrome, click the visible directory control, and record the initial rendered item count and oldest date. Physically scroll the visible directory with host Chrome control in bounded steps, recording item count after every lazy-load batch, until an entry older than the active overlap or audit boundary is rendered; do not call /web/mp/articles or another hidden list API.
+    lazy_load_guard: The first rendered batch is not complete coverage. Unless that first batch already contains an entry older than the boundary, require at least one physical scroll, require directoryEntriesLoaded to grow beyond initialDirectoryEntries, and continue until a strictly older-than-boundary entry is captured. A stalled count before the boundary is a scan failure, never a successful boundary result.
+    catalog_snapshot: Write a run-owned per-account JSON snapshot with boundary, initialDirectoryEntries, initialOldestDate, scrollSteps, directoryEntriesLoaded, oldestLoadedDate, boundaryReached, parseErrors, and every ordered date/title entry. Require directoryEntriesLoaded to equal entries.length.
+    reconciliation_command: node scripts/wechat2md/weread_catalog_audit.mjs --catalog <run_dir>/<account>-weread-catalog.json --account-dir <account.output_dir> --output <run_dir>/<account>-weread-catalog-audit.json
+    reconciliation_policy: Run the catalog audit before recovery, download only its missing entries after official og:url extraction, then rerun it. Save every opened article's exact title, rendered date, og:url, biz, mid, and idx in a run-owned official-article evidence JSON. Require missing=0, ambiguous=0, localReadErrors=0, and dateMismatches=0 before reporting local reconciliation success.
+    metadata_repair_policy: After missing and ambiguity are zero, run weread_catalog_audit.mjs once with --apply-date-repairs true and once with --apply-url-repairs true --official-articles <run-owned-evidence> --expected-biz <account.stable_biz>, always as separate invocations with an explicit run-owned --backup-dir. Date repair may change only the uniquely matched frontmatter date. URL repair may replace only a trusted mp.weixin.qq.com article URL that lacks stable identity; it must reject malformed official evidence, cross-account biz, ambiguous title/date matches, and any conflicting stable biz/mid/idx. Retain every backup and rerun the audit without repair to prove dateMismatches=0, canonicalUrlsVerified equals the official evidence count, urlRepairsNeeded=0, urlIdentityMismatches=0, and officialUrlEvidenceErrors=0.
+    dashboard_reconciliation: After local catalog and canonical URL reconciliation succeeds, reuse normal Chrome at http://localhost:3000/dashboard/account, select only the exact account, and run 对齐本地导出. The client may restore only exact account-name records whose URL carries matching stable biz plus explicit positive numeric mid and idx; short links, missing idx, and cross-account identities are skipped. Run the action a second time and require zero new articles/messages, then verify every official-evidence article by title and publication date in the account article view.
+    dashboard_state_policy: Dashboard reconciliation updates only the localhost IndexedDB article/info cache and never changes the workflow sync-state file, source coverage, integrity-audit completion, or high-watermark.
+    date_normalization: Resolve Today, Yesterday, and M/D labels in Asia/Shanghai using the run date, decrementing the year only when the ordered directory crosses a year boundary. The final date must still equal the full date rendered inside the opened article.
+    article_extraction: Click each date-eligible directory entry, wait for the rendered title and publication date, then read only the rendered main article iframe srcdoc. Extract meta og:title and meta og:url, require the title/date to match the selected directory entry, normalize HTML entities, and reject missing, malformed, cross-account, title-only, or empty-body records.
+    maximum_directory_entries_per_account: 500
+    interaction_interval_seconds: 1
+    progress_guard: Track the ordered directory date/title tuple, initial item count, post-scroll item counts, oldest rendered date, physical scroll count, and every accepted canonical URL. Stop on a repeated non-advancing viewport, stalled lazy-loaded item count before the boundary, duplicate canonical URL with conflicting metadata, reader-heading change, login loss, CAPTCHA, malformed srcdoc, or the entry limit. A technical failure preserves state and must not be reported as complete coverage.
+    coverage: partial
+    source_limit: WeRead can publish late or omit individual public-account articles. Reaching the requested date boundary proves only scan depth, not complete account history.
+    state_policy: WeRead results may be downloaded and included in the current-run manifest, but never complete an integrity audit or advance high-watermark. Preserve previous per-account state even when the requested date boundary is reached.
+    date_authority: Use the date rendered inside the official article as the publication date. When a mirror-derived historical copy disagrees, retain it only as explicit backup evidence and use the official date/URL for canonical reconciliation.
+    download_identity: Pass the extracted og:url as both url and canonicalUrl, expectedBiz=account.stable_biz, mode=lite, and imageMode=cdn to /api/local/wechat2md. Require the downloaded page's actual biz, title, publication date, and nonempty body to match before writing Markdown.
+    unavailable_policy: An existing_chrome_unavailable, login_required, or captcha_required result stops that account with an actionable warning and never switches browser. Other visible-page failures may continue only to public_index_fallback as explicitly degraded partial recovery.
+  public_index_fallback:
+    endpoint: /api/local/public-article-discovery
+    trigger: Use only after the complete sources and weread_chrome_fallback are unavailable for a non-user-action reason, or when selected explicitly for degraded login-free partial recovery.
+    request_body: Pass accountName=account.name, expectedBiz=account.stable_biz, and notBefore equal to the active overlap or audit date boundary.
+    request_policy: Public Sogou and WeChat article requests use the endpoint's bounded 3.5-second and 3-second gates plus a 15-second per-request timeout; they do not use authenticated_api_lease and never read browser cookies, storage, or Credential secrets.
+    query_bounds: Use only the endpoint's fixed account-specific profile, at most 3 queries covering the account, current year, and active date-floor year, follow actual next-page links for at most 10 pages per query, and verify at most 300 date-eligible exact-account candidates after stable Sogou document-ID deduplication.
+    result_page_policy: Require a real wx.sogou.com result page on every request; treat home, anti-spider, redirect, and other unexpected pages as query failures instead of successful empty results.
+    verification: Require an exact source-account name match on the public index, then fetch the signed acquisition URL and require expected stable biz, valid mid plus idx, publish time, title, account name, and nonempty article content before accepting a candidate.
+    identity_policy: Use the short-lived signed link only for immediate acquisition. Pass canonicalLink separately as canonicalUrl for durable frontmatter, local deduplication, and manifest identity.
+    coverage: partial
+    state_policy: Public-index results may be downloaded and included in the current-run manifest, but never satisfy bounded-overlap completion, integrity-audit completion, or high-watermark advancement. Preserve the previous per-account state even when public discovery or download succeeds.
+    zero_result_policy: After a successful bounded scan with no exact in-range candidate, repeat the primary query's first page once. If that also verifies zero candidates, treat it as a successful partial no-op for acquisition, report the retry and warning, and preserve the previous per-account state; never claim complete history.
+    failure_policy: If every public query fails or candidate verification fails, stop that account safely, preserve its previous state, and continue only with independently leased accounts.
+  trusted_public_mirror_recovery:
+    discovery_endpoint: /api/local/public-mirror-discovery
+    download_endpoint: /api/local/wechat2md/mirror
+    trigger: Use only for an explicit exact title and date supplied by a verified source or human review. Do not derive recovery candidates from today-reading mirrors or broad title guesses.
+    allowed_source: https://www.kchuhai.com/report/view-<numeric-id>.html only; reject redirects, credentials, alternate hosts, ports, and arbitrary paths.
+    verification: Require exact expected stable-biz profile, account name, title, publication date, a nonempty mirror body, and an https://mp.weixin.qq.com/s original link before writing.
+    provenance: Store the WeChat original URL as frontmatter url and the verified mirror page as source_evidence. Mirror CDN image links remain remote.
+    coverage: partial_recovery
+    state_policy: Successfully recovered mirror articles may enter the current manifest, analysis, and receipt-bound import, but never complete the integrity audit or advance sync state.
+    zero_result_policy: A trusted mirror miss is a warning and leaves the deficit unresolved; never replace it with title-only content.
+  title_keyword: ""
+  publish_date_min: "2025-01-01"
+  cutoff_policy: Include articles published on or after publish_date_min; do not fetch 2024 or older unless the user updates this workflow.
+  page_size: 5
+  default_strategy: persistent_high_watermark_with_bounded_overlap
+  bounded_overlap:
+    base_pages_after_crossing_watermark: 6
+    maximum_pages_after_crossing_watermark: 12
+    minimum_calendar_overlap_days: 14
+    maximum_calendar_overlap_days: 45
+    dynamic_window_rule: Per account, set overlap days to clamp(days_since_last_success + 7, 14, 45), and add one page per extra 7 days above 14, capped at 12 pages.
+    rule: For each account, scan newest-first until its stored high-watermark is crossed and both dynamically calculated overlap bounds are satisfied; reconcile every page in that bounded window against local index.md files.
+  stop_conditions:
+    - stop when an article publish date is before publish_date_min
+    - on normal runs, stop per account only after its persisted high-watermark has been crossed and bounded_overlap is complete
+  integrity_audit:
+    interval_days: 30
+    due_when: an account state is missing, last_integrity_audit_at is missing, or the last successful audit is at least 30 days old
+    scan_rule: Ignore the normal high-watermark stop and scan every page for the due account down to publish_date_min.
+    reconciliation: Verify every discovered article against the local index.md marker and include recovered gaps in the current-run manifest.
+    completion_rule: Update an account's last_integrity_audit_at only after its date-floor scan and reconciliation complete without error.
+    permanent_boundary_rule: A run of pages with no missing files is never a permanent history boundary.
+  local_download_check:
+    marker: index.md
+
+staging_cleanup:
+  scope: Exact current-run manifest, analysis, receipt, and staging paths carrying this run_id only.
+  finally_rule: Remove current-run staging paths in finally on success or failure; persistent receipts, sync state, and explicit backup directories are not staging and must be retained.
+  stale_rule: Never glob-delete another run's paths. Stale cleanup requires an exact run-owned path plus proof that all account leases associated with that run are absent or stale.
+
+download:
+  endpoint: /api/local/wechat2md
+  trusted_mirror_endpoint: /api/local/wechat2md/mirror
+  output_dir: /Users/adobe/Project/output/WechatArticles
+  format: markdown
+  mode: lite
+  image_mode: cdn
+  request_body:
+    mode: lite
+    imageMode: cdn
+    outputDir: /Users/adobe/Project/output/WechatArticles
+    accountName: account.name
+    expectedBiz: account.stable_biz
+    canonicalUrl: article.canonicalLink when article source is public_index
+  trusted_mirror_request_body:
+    imageMode: cdn
+    outputDir: /Users/adobe/Project/output/WechatArticles
+    accountName: account.name
+    expectedBiz: account.stable_biz
+    title: mirror.title
+    publishDate: mirror.publishDate
+    mirrorUrl: mirror.mirrorUrl
+  post_download_cleanup:
+    scope: current_run_articles_only
+    remove_images_dir_when_present: false
+    on_detect: Fail verification and report the existing directory for explicit review; never delete prior assets automatically.
+  verification:
+    - every downloaded article has index.md
+    - current-run successful download count equals unique current-run index.md path count
+    - no current-run article directory contains an images subdirectory
+    - current-run Markdown contains no local images/ references
+
+file_manifest:
+  run_dir: /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-runs/wechat-product-accounts-incremental/<run_id>
+  name: files.json
+  include: current_run_downloaded_articles_only
+  method: write_json_file_list
+  schema:
+    accounts:
+      account.name:
+        files:
+          - /Users/adobe/Project/output/WechatArticles/<account.name>/<article-title>/index.md
+    all_files:
+      - /Users/adobe/Project/output/WechatArticles/<account.name>/<article-title>/index.md
+  reason: Keep the run scope explicit without copying article Markdown or scanning unrelated historical output by default.
+  provenance_rule: Current-run trusted mirror downloads are eligible only when their Markdown contains both the WeChat original url and trusted source_evidence frontmatter.
+  empty_run_policy: If all_files is empty, skip analysis and structured import and report a successful no-op with zero analysis/import counts. Advance state only for accounts whose complete authenticated reconciliation succeeded; preserve state for every WeRead or public-index partial account.
+
+product_distillation:
+  cwd: /Users/adobe/Project/tools/wechat-article-exporter
+  source_root: /Users/adobe/Project/output/WechatArticles
+  target_accounts:
+    - 游戏吗喽说
+    - 新游观察
+    - 王董的新游戏
+  analysis_outputs:
+    - /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-analysis/publisher-analysis/product-accounts-<run_id>/_publisher_analysis.json
+    - /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-analysis/publisher-analysis/product-accounts-<run_id>/_publisher_analysis.md
+    - /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-analysis/publisher-analysis/product-accounts-<run_id>/_analysis_quality_report.json
+    - /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-analysis/publisher-analysis/product-accounts-<run_id>/_structured_import_receipt.json
+  analysis_commands:
+    - python3 scripts/wechat2md/analysis/publisher-analysis.py --source-dir /Users/adobe/Project/output/WechatArticles --file-list <manifest> --output-dir /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-analysis/publisher-analysis/product-accounts-<run_id> --dry-run
+    - python3 scripts/wechat2md/analysis/publisher-analysis.py --source-dir /Users/adobe/Project/output/WechatArticles --file-list <manifest> --output-dir /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-analysis/publisher-analysis/product-accounts-<run_id>
+  import_commands:
+    - python3 scripts/wechat2md/kb-import/batch-products-structured-import.py --data-json /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-analysis/publisher-analysis/product-accounts-<run_id>/_publisher_analysis.json --receipt-json /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-analysis/publisher-analysis/product-accounts-<run_id>/_structured_import_receipt.json --dry-run
+    - python3 scripts/wechat2md/kb-import/batch-products-structured-import.py --data-json /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-analysis/publisher-analysis/product-accounts-<run_id>/_publisher_analysis.json --receipt-json /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-analysis/publisher-analysis/product-accounts-<run_id>/_structured_import_receipt.json --confirm
+  post_import_checks:
+    - python3 scripts/wechat2md/kb-import/cleanup-wechat-products-structured-noise.py --dry-run
+  import_policy:
+    default: Run dry-run first. It writes a SHA256-bound, expiring receipt; only run --confirm with the same current-run data-json, candidate summary, quality state, subject filter, and unexpired receipt.
+    target_runtime: knowledge-vault structured/products is the formal products KB runtime. Do not treat wiki syntheses as the final products KB landing surface.
+    no_arg_import_guard: Do not run batch-products-structured-import.py without --data-json and either --dry-run or --confirm.
+    noise_guard: batch-products-structured-import filters obvious non-product extraction fragments; post-import noise dry-run should report noisy_docs=0 for active structured product docs.
+    quality_hard_gate: Refuse --confirm unless analysis JSON quality.status is pass and the receipt matches. Sentence-like product-name noise is a hard failure; unknown publishers and publisher conflicts are review warnings, not batch-wide blockers. Article-level publisher labels remain candidates and never become stable attribution edges without verified single-product evidence.
+    conflict_policy: Merge all same-slug sources. Preserve publisher conflicts as needs-review records with no stable attribution edge; preserve unknown publishers as weak product evidence without an attribution edge.
+    override_policy: Scheduled automation must never use --high-risk-override-quality-gate. A human-only override requires that explicit flag, a written reason, and an audit report.
+  legacy_product_osint_import:
+    status: not_default_for_this_workflow
+    scripts:
+      - scripts/wechat2md/analysis/extract-products.py
+      - scripts/wechat2md/kb-import/write-known-products.py
+      - scripts/wechat2md/kb-import/write-multi-pub-light.py
+      - scripts/wechat2md/kb-import/write-single-pub.py
+    reason: These scripts consume static all-run artifacts and some legacy source wording; they must be explicitly reviewed and adapted before use with current-run manifests.
+  preflight:
+    - Use py_compile or file existence checks for scripts; do not use --help as a harmless validation.
+    - Confirm publisher-analysis dry-run reports total_articles equal to the manifest file count and inspect quality status before writing analysis outputs.
+    - Require _analysis_quality_report.json status=pass before the normal confirm path.
+    - Confirm batch-products-structured-import dry-run writes a matching, unexpired receipt for the current-run data-json before running --confirm.
+    - After confirm, verify at least one newly imported product can be found with search-structured-kb.py --kb products.
+    - After confirm, run cleanup-wechat-products-structured-noise.py --dry-run and require noisy_docs=0.
+  allowed_writes:
+    - /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-analysis
+    - /Users/adobe/Project/knowledge-vault/documents/product:wechat-product-*.json
+    - /Users/adobe/Project/knowledge-vault/structured/products/records.jsonl
+    - /Users/adobe/Project/knowledge-vault/structured/products/index.sqlite
+    - /Users/adobe/Project/knowledge-vault/structured/products/manifest.json
+    - /Users/adobe/Project/knowledge-vault/structured/products/views
+  forbidden_commands:
+    - /Users/adobe/Project/knowledge-vault/scripts/import-steam-indienova.py
+    - /Users/adobe/Project/knowledge-vault/scripts/build-steam-catalog-index.py
+    - /Users/adobe/Project/knowledge-vault/scripts/rebuild-kb-store.py
+
+report:
+  required_fields:
+    - accounts_processed
+    - accounts_skipped_busy
+    - per_account_latest_synced_article_count
+    - per_account_candidate_count_since_2025
+    - per_account_new_download_count
+    - output_directories
+    - download_config
+    - file_manifest
+    - lease_result
+    - per_account_lease_results
+    - service_startup_lease_result
+    - service_compatibility_result
+    - authenticated_api_lease_result
+    - per_account_high_watermark_before
+    - per_account_high_watermark_after
+    - per_account_bounded_overlap_pages_scanned
+    - per_account_integrity_audit_due
+    - per_account_integrity_audit_completed
+    - per_account_scan_source
+    - per_account_scan_coverage
+    - per_account_profile_fallback_status
+    - per_account_public_fallback_status
+    - per_account_public_fallback_warnings
+    - per_account_weread_status
+    - per_account_weread_initial_directory_entries
+    - per_account_weread_directory_entries_loaded
+    - per_account_weread_scroll_steps
+    - per_account_weread_articles_discovered
+    - per_account_weread_boundary_reached
+    - per_account_weread_oldest_publish_time
+    - per_account_weread_catalog_missing_before
+    - per_account_weread_catalog_missing_after
+    - per_account_weread_catalog_ambiguous_after
+    - per_account_weread_date_repairs
+    - per_account_weread_official_url_entries
+    - per_account_weread_canonical_urls_verified
+    - per_account_weread_url_repairs
+    - per_account_weread_url_identity_mismatches
+    - per_account_weread_official_url_evidence_errors
+    - per_account_weread_warnings
+    - per_account_dashboard_recovered_articles
+    - per_account_dashboard_recovered_messages
+    - per_account_dashboard_unverifiable_local_records
+    - per_account_dashboard_article_count_after
+    - per_account_dashboard_verified_official_articles
+    - per_account_dashboard_idempotent_recovery_articles
+    - per_account_dashboard_idempotent_recovery_messages
+    - per_account_trusted_mirror_candidates
+    - per_account_trusted_mirror_downloads
+    - per_account_unresolved_partial_source_articles
+    - profile_credential_cache_status
+    - integrity_audit_date_floor
+    - product_analysis_outputs
+    - analysis_quality_status
+    - analysis_unknown_publisher_ratio
+    - analysis_quality_warnings
+    - analysis_suspicious_name_count
+    - analysis_publisher_conflict_count
+    - structured_import_receipt
+    - import_written_count
+    - import_skipped_count
+    - import_error_count
+    - product_structured_import_status

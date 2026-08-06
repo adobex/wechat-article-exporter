@@ -3,7 +3,7 @@ import type { ChipColor } from '#ui/types';
 import CredentialsDialog, { type CredentialState } from '~/components/global/CredentialsDialog.vue';
 import QQGroupModal from '~/components/modal/QQGroup.vue';
 import { docsWebSite } from '~/config';
-import { gotoLink } from '~/utils';
+import { openExternalLink } from '~/utils/navigation';
 
 const modal = useModal();
 
@@ -30,6 +30,13 @@ const credentialBadgeText = computed(() => {
   return count > 9 ? '+' : `${count}`;
 });
 const isCredentialActive = computed(() => credentialState.value === 'active');
+
+const { accountEventBus } = useAccountEventBus();
+const stopAccountEventListener = accountEventBus.on(event => {
+  if (event === 'credential-required') credentialsDialogOpen.value = true;
+});
+
+onUnmounted(stopAccountEventListener);
 </script>
 
 <template>
@@ -71,11 +78,11 @@ const isCredentialActive = computed(() => credentialState.value === 'active');
         v-model:state="credentialState"
         @update:pending-count="credentialPendingCount = $event"
       />
-      <UTooltip text="抓取 Credentials">
+      <UTooltip text="获取临时凭据">
         <div class="relative">
           <UIcon
             @click="credentialsDialogOpen = true"
-            name="i-lucide:dog"
+            name="i-lucide:key-round"
             :class="[
               'size-7 cursor-pointer transition-colors',
               { 'text-zinc-400 hover:text-blue-500': !isCredentialActive },
@@ -97,7 +104,7 @@ const isCredentialActive = computed(() => credentialState.value === 'active');
       <UTooltip text="文档">
         <UIcon
           name="i-lucide:book-open"
-          @click="gotoLink(docsWebSite)"
+          @click="openExternalLink(docsWebSite)"
           class="size-7 text-zinc-400 hover:text-blue-500 cursor-pointer transition-colors"
         />
       </UTooltip>
@@ -107,7 +114,7 @@ const isCredentialActive = computed(() => credentialState.value === 'active');
     <li>
       <UTooltip text="GitHub">
         <UIcon
-          @click="gotoLink('https://github.com/wechat-article/wechat-article-exporter')"
+          @click="openExternalLink('https://github.com/wechat-article/wechat-article-exporter')"
           name="i-lucide:github"
           class="size-7 text-zinc-400 hover:text-blue-500 cursor-pointer transition-colors"
         />

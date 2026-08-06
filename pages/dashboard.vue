@@ -21,6 +21,27 @@
 </template>
 
 <script setup lang="ts">
+import { AllCommunityModule, ModuleRegistry } from 'ag-grid-community';
+import {
+  ColumnsToolPanelModule,
+  LicenseManager,
+  RowNumbersModule,
+  SetFilterModule,
+  SideBarModule,
+  StatusBarModule,
+} from 'ag-grid-enterprise';
 import GlobalActions from '~/components/dashboard/Actions.vue';
 import SideBar from '~/components/dashboard/SideBar.vue';
+
+const runtimeConfig = useRuntimeConfig();
+
+ModuleRegistry.registerModules([
+  AllCommunityModule,
+  ColumnsToolPanelModule,
+  RowNumbersModule,
+  SetFilterModule,
+  SideBarModule,
+  StatusBarModule,
+]);
+LicenseManager.setLicenseKey(runtimeConfig.public.aggridLicense);
 </script>

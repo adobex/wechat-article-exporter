@@ -1,5 +1,15 @@
 <script setup lang="ts">
-const { loggedIn, user, clear, openInPopup, session } = useUserSession();
+interface DashboardUser {
+  username: string;
+  avatar: string;
+  name: string;
+  plan: 'free' | 'pro';
+  provider: 'GitHub' | 'Google';
+}
+
+// 在线账号模块已从本地工具移除；保留登录入口，但不伪造会话状态。
+const loggedIn = ref(false);
+const user = ref<DashboardUser | null>(null);
 
 const open = defineModel<boolean>('open', { default: false });
 
@@ -13,11 +23,13 @@ const loginWithGoogle = async () => {
   window.location.href = '/auth/google';
 };
 
-// 登出功能
-const logout = async () => {};
+const clear = async () => {
+  loggedIn.value = false;
+  user.value = null;
+};
 
 // 由于 nuxt-auth-utils 库在授权时的bug，在授权之前需要手动删除临时cookie
-function deleteCookie(name) {
+function deleteCookie(name: string) {
   document.cookie = `${name}=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/`;
 }
 

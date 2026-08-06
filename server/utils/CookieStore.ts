@@ -1,5 +1,5 @@
-import { H3Event, parseCookies } from 'h3';
-import { CookieKVValue, getMpCookie, setMpCookie } from '~/server/kv/cookie';
+import { type H3Event, parseCookies } from 'h3';
+import { type CookieKVValue, getMpCookie, removeMpCookie, setMpCookie } from '~/server/kv/cookie';
 
 // 表示一条 set-cookie 记录的解析结果
 export type CookieEntity = Record<string, string | number>;
@@ -78,10 +78,10 @@ export class AccountCookie {
             if (keyLower === 'expires' && value) {
               try {
                 const timestamp = Date.parse(value);
-                if (!isNaN(timestamp)) {
+                if (!Number.isNaN(timestamp)) {
                   cookieObj.expires_timestamp = timestamp; // 添加时间戳（毫秒）
                 }
-              } catch (e) {
+              } catch {
                 // 如果日期解析失败，忽略时间戳字段
               }
             }
@@ -107,15 +107,19 @@ export class AccountCookie {
 }
 
 // 所有用户的 cookie 仓库
-class CookieStore {
+export class CookieStore {
   // key 为 authKey, value 为 AccountCookie 实例
   // 使用 Map 的插入顺序特性实现 LRU 淘汰
-  store: Map<string, AccountCookie> = new Map<string, AccountCookie>();
+  private readonly store: Map<string, AccountCookie> = new Map<string, AccountCookie>();
+  private readonly deletingKeys = new Set<string>();
+  private readonly pendingRemovals = new Map<string, Promise<boolean>>();
 
   // 内存缓存最大条目数，防止无限增长
   private readonly maxSize: number = 1000;
 
   async getAccountCookie(authKey: string): Promise<AccountCookie | null> {
+    if (this.deletingKeys.has(authKey)) return null;
+
     // 优先从本地内存取
     let cachedAccountCookie = this.store.get(authKey);
 
@@ -128,7 +132,7 @@ class CookieStore {
 
     // 如果内存没有，则从 kv 数据库取
     const cookieValue = await getMpCookie(authKey);
-    if (!cookieValue) {
+    if (!cookieValue || this.deletingKeys.has(authKey)) {
       return null;
     }
 
@@ -171,8 +175,34 @@ class CookieStore {
    * 移除用户的 cookie（用于登出等场景）
    * @param authKey
    */
-  removeCookie(authKey: string): void {
+  async removeCookie(authKey: string): Promise<boolean> {
+    const pending = this.pendingRemovals.get(authKey);
+    if (pending) return pending;
+
+    const removal = this.removeCookieAtomically(authKey);
+    this.pendingRemovals.set(authKey, removal);
+    try {
+      return await removal;
+    } finally {
+      this.pendingRemovals.delete(authKey);
+    }
+  }
+
+  private async removeCookieAtomically(authKey: string): Promise<boolean> {
+    const cached = this.store.get(authKey);
+    this.deletingKeys.add(authKey);
     this.store.delete(authKey);
+    try {
+      const removed = await removeMpCookie(authKey);
+      if (!removed) {
+        if (cached) this.store.set(authKey, cached);
+        return false;
+      }
+      this.store.delete(authKey);
+      return true;
+    } finally {
+      this.deletingKeys.delete(authKey);
+    }
   }
 
   /**
@@ -203,16 +233,11 @@ class CookieStore {
     return accountCookie.token;
   }
 
-  /**
-   * 转换为 json 格式，方便存储与传输
-   * 返回一个对象，键为 uuid，值为解析后的 cookie 对象
-   */
-  toJSON(): Record<string, AccountCookie> {
-    const json: Record<string, AccountCookie> = {};
-    for (const [authKey, accountCookie] of this.store) {
-      json[authKey] = accountCookie;
-    }
-    return json;
+  getDebugSummary(): { activeSessionCount: number; pendingRemovalCount: number } {
+    return {
+      activeSessionCount: this.store.size,
+      pendingRemovalCount: this.pendingRemovals.size,
+    };
   }
 }
 

@@ -34,7 +34,7 @@
               :loading="fetchAllArticlesBtnLoading"
               :disabled="!selectedAccount || !selectedAlbum || albumArticles.length === 0 || noMoreData"
               @click="fetchAllArticles"
-              >抓取全部文章链接</UButton
+              >同步全部文章链接</UButton
             >
           </div>
         </div>
@@ -44,7 +44,7 @@
             variant="link"
             size="md"
             :disabled="!selectedAccount || !selectedAlbum"
-            @click="gotoLink(originalAlbumURL)"
+            @click="openExternalLink(originalAlbumURL)"
             >跳转到原始链接</UButton
           >
           <UButton
@@ -58,7 +58,7 @@
             <Loader v-if="batchDownloadLoading" :size="20" class="animate-spin" />
             <span v-if="batchDownloadLoading"
               >{{ batchDownloadPhase }}:
-              <span v-if="batchDownloadPhase === '下载文章内容'"
+              <span v-if="batchDownloadPhase === '缓存文章正文'"
                 >{{ batchDownloadedCount }}/{{ selectedArticleCount }}</span
               >
               <span v-if="batchDownloadPhase === '打包'">{{ batchPackedCount }}/{{ batchDownloadedCount }}</span>
@@ -131,8 +131,8 @@ import { websiteName } from '~/config';
 import { type MpAccount } from '~/store/v2/info';
 import type { AppMsgAlbumResult, ArticleItem, BaseInfo } from '~/types/album';
 import type { AppMsgAlbumInfo, DownloadableArticle } from '~/types/types';
-import { gotoLink } from '~/utils';
 import { formatAlbumTime } from '~/utils/album';
+import { openExternalLink } from '~/utils/navigation';
 
 useHead({
   title: `合集下载 | ${websiteName}`,
@@ -304,7 +304,7 @@ function doBatchDownload() {
   batchDownload(articles, filename);
 }
 
-// 抓取全部文章链接
+// 同步全部文章链接
 const fetchAllArticlesBtnLoading = ref(false);
 async function fetchAllArticles() {
   fetchAllArticlesBtnLoading.value = true;

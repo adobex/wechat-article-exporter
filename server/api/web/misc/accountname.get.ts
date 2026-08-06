@@ -1,4 +1,4 @@
-import * as cheerio from 'cheerio';
+import { extractWechatAccountName } from '#shared/utils/html';
 import { USER_AGENT } from '~/config';
 
 interface AccountNameQuery {
@@ -42,7 +42,6 @@ export default defineEventHandler(async event => {
   const res = await fetch(url, {
     headers: {
       Referer: 'https://mp.weixin.qq.com/',
-      Origin: 'https://mp.weixin.qq.com',
       'User-Agent': USER_AGENT,
     },
     redirect: 'manual',
@@ -53,17 +52,15 @@ export default defineEventHandler(async event => {
       statusMessage: `目标 URL 发生重定向 (status=${res.status})，已拒绝以防止 SSRF`,
     });
   }
-  const rawHtml = await res.text();
 
-  // 微信改版后文章页移除了 .wx_follow_nickname 这个 class，公众号名称改为承载在内联 JS 变量里。
-  // 优先从 `var nickname = htmlDecode("…")` / `var nickname = "…"` 提取，兼容新旧两种写法。
-  const match = rawHtml.match(/var\s+nickname\s*=\s*(?:htmlDecode\()?\s*["']([^"']+)["']/);
-  if (match) {
-    // 借助 cheerio 顺带解码 HTML 实体（如 &amp; -> &）；公众号昵称不含尖括号，拼接安全
-    return cheerio.load(`<div>${match[1]}</div>`).text().trim();
+  if (!res.ok) {
+    throw createError({
+      statusCode: res.status,
+      statusMessage: `获取公众号名称失败: HTTP ${res.status}`,
+    });
   }
 
-  // 兜底：旧结构的 .wx_follow_nickname，或新结构中已渲染的 .account_nickname_inner
-  const $ = cheerio.load(rawHtml);
-  return $('.wx_follow_nickname, .account_nickname_inner').first().text().trim();
+  const rawHtml = await res.text();
+
+  return extractWechatAccountName(rawHtml);
 });

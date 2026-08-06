@@ -3,9 +3,9 @@ import { type EventBusKey, useEventBus } from '@vueuse/core';
 const accountEventKey: EventBusKey<string> = Symbol('account-event');
 
 // 统一的账号相关事件，用于不同组件之间同步状态
-type AccountEvent = 'account-added' | 'account-removed';
+type AccountEvent = 'account-added' | 'account-removed' | 'credential-required';
 interface AccountEventPayload {
-  fakeid: string;
+  fakeid?: string;
 }
 
 export default () => {

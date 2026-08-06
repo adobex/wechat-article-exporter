@@ -17,6 +17,13 @@
 交流群(QQ):
 - `494723496`
 
+## Codex 能力契约
+
+- 输入：公众号/文章列表、导出格式、credentials/session 上下文、评论/阅读量范围、部署目标。
+- 输出：文章正文导出、图片资源、评论/回复/阅读量表格、开放 API 调试结果或部署产物。
+- 副作用：写入本地导出目录；评论/阅读数据需要凭证或抓包上下文；Docker/Cloudflare 会产生构建或远程发布副作用。
+- 验证：代码改动先跑 `yarn quality && yarn build`；部署前再跑 preview 或对应 Docker/Cloudflare 检查。
+
 
 ## :books: 如何使用？
 

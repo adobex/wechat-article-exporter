@@ -1,6 +1,6 @@
 import dayjs from 'dayjs';
 import { request } from '#shared/utils/request';
-import { getCookieFromResponse, getCookiesFromRequest } from '~/server/utils/CookieStore';
+import { AccountCookie, getCookiesFromRequest } from '~/server/utils/CookieStore';
 import { proxyMpRequest } from '~/server/utils/proxy-request';
 
 export default defineEventHandler(async event => {
@@ -32,8 +32,10 @@ export default defineEventHandler(async event => {
   });
 
   // 从响应中取出唯一的 set-cookie (即上一步 `action=login` 标志所设置的 auth-key=xxx)
-  const authKey = getCookieFromResponse('auth-key', response);
-  if (!authKey) {
+  const authKeyCookie = AccountCookie.parse(response.headers.getSetCookie()).find(cookie => cookie.name === 'auth-key');
+  const authKey = authKeyCookie?.value;
+  const authKeyExpiresAt = authKeyCookie?.expires_timestamp;
+  if (typeof authKey !== 'string' || typeof authKeyExpiresAt !== 'number') {
     return {
       err: '登录失败，请稍后重试',
     };
@@ -53,7 +55,7 @@ export default defineEventHandler(async event => {
   const body = JSON.stringify({
     nickname: nick_name,
     avatar: head_img,
-    expires: dayjs().add(4, 'days').toString(),
+    expires: dayjs(authKeyExpiresAt).toString(),
   });
   const headers = new Headers(response.headers);
   headers.set('Content-Length', new TextEncoder().encode(body).length.toString());

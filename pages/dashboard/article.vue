@@ -21,6 +21,12 @@ import GridArticleActions from '~/components/grid/ArticleActions.vue';
 import GridCoverTooltip from '~/components/grid/CoverTooltip.vue';
 import GridStatusBar from '~/components/grid/StatusBar.vue';
 import AccountSelectorForArticle from '~/components/selector/AccountSelectorForArticle.vue';
+import {
+  EXPORT_FORMAT_LABELS,
+  MD_IMAGE_MODE_LABELS,
+  WECHAT2MD_MODE_LABELS,
+  type Wechat2mdMetadataMap,
+} from '~/composables/useDownloadOptions';
 import { isDev, websiteName } from '~/config';
 import { sharedGridOptions } from '~/config/shared-grid-options';
 import { articleDeleted, getArticleCache, updateArticleStatus } from '~/store/v2/article';
@@ -41,14 +47,32 @@ useHead({
 // 当前页面的数据模型
 interface Article extends AppMsgExWithFakeID, Partial<ArticleMetadata> {
   /**
-   * 文章内容是否已下载
+   * 文章正文是否已缓存
    */
   contentDownload: boolean;
 
   /**
-   * 留言内容是否已下载
+   * 留言内容是否已同步
    */
   commentDownload: boolean;
+
+  /**
+   * 是否已经通过 wechat2md 导出为本地 Markdown
+   */
+  markdownExported: boolean;
+  markdownPath?: string;
+  articleDir?: string;
+}
+
+interface Wechat2mdManifestEntry {
+  title: string;
+  accountName: string;
+  publishDate: string;
+  url: string;
+  filepath: string;
+  articleDir: string;
+  relativePath: string;
+  mtimeMs: number;
 }
 
 let globalRowData: Article[] = [];
@@ -151,20 +175,29 @@ const columnDefs = ref<ColDef[]>([
     cellClass: 'flex justify-center items-center',
   },
   {
-    headerName: '内容已下载',
+    headerName: '正文已缓存',
     field: 'contentDownload',
     cellDataType: 'boolean',
     filter: 'agSetColumnFilter',
-    filterParams: createBooleanColumnFilterParams('已下载', '未下载'),
+    filterParams: createBooleanColumnFilterParams('已缓存', '未缓存'),
+    minWidth: 150,
+    cellClass: 'flex justify-center items-center',
+  },
+  {
+    headerName: 'Markdown已导出',
+    field: 'markdownExported',
+    cellDataType: 'boolean',
+    filter: 'agSetColumnFilter',
+    filterParams: createBooleanColumnFilterParams('已导出', '未导出'),
     minWidth: 150,
     cellClass: 'flex justify-center items-center',
   },
   {
     field: 'commentDownload',
-    headerName: '留言已下载',
+    headerName: '留言已同步',
     cellDataType: 'boolean',
     filter: 'agSetColumnFilter',
-    filterParams: createBooleanColumnFilterParams('已下载', '未下载'),
+    filterParams: createBooleanColumnFilterParams('已同步', '未同步'),
     minWidth: 150,
     cellClass: 'flex justify-center items-center',
   },
@@ -280,6 +313,15 @@ const columnDefs = ref<ColDef[]>([
     initialHide: true,
   },
   {
+    headerName: 'Markdown路径',
+    field: 'markdownPath',
+    cellDataType: 'text',
+    filter: 'agTextColumnFilter',
+    minWidth: 260,
+    initialHide: true,
+    cellClass: 'font-mono',
+  },
+  {
     headerName: '操作',
     field: 'link',
     sortable: false,
@@ -303,6 +345,12 @@ const columnDefs = ref<ColDef[]>([
 const gridOptions: GridOptions = defu(
   {
     getRowId: (params: GetRowIdParams) => `${params.data.fakeid}:${params.data.aid}`,
+    isExternalFilterPresent: () => normalizedTitleKeyword().length > 0,
+    doesExternalFilterPass: node => {
+      const keyword = normalizedTitleKeyword();
+      if (!keyword) return true;
+      return normalizeText(node.data?.title).toLowerCase().includes(keyword);
+    },
     statusBar: {
       statusPanels: [
         {
@@ -316,10 +364,12 @@ const gridOptions: GridOptions = defu(
 );
 
 const gridApi = shallowRef<GridApi | null>(null);
+const titleKeyword = ref('');
 function onGridReady(params: GridReadyEvent) {
   gridApi.value = params.api;
 
   restoreColumnState();
+  applyTitleKeywordFilter();
 }
 
 function onColumnStateChange() {
@@ -347,6 +397,22 @@ function onFilterChanged(event: FilterChangedEvent) {
   event.api.deselectAll();
 }
 
+function normalizedTitleKeyword() {
+  return normalizeText(titleKeyword.value).toLowerCase();
+}
+
+function applyTitleKeywordFilter() {
+  gridApi.value?.onFilterChanged();
+}
+
+function clearTitleKeyword() {
+  titleKeyword.value = '';
+}
+
+watch(titleKeyword, () => {
+  applyTitleKeywordFilter();
+});
+
 const preferences = usePreferences();
 const hideDeleted = computed(() => (preferences.value as unknown as Preferences).hideDeleted);
 
@@ -357,41 +423,165 @@ function preview(article: Article) {
 }
 
 const loading = ref(false);
+const localExportLoading = ref(false);
+const localExportLoaded = ref(false);
+const localExportRecords = shallowRef<Wechat2mdManifestEntry[]>([]);
 
 // 只能选择单个账号
 const selectedAccount = ref<MpAccount | undefined>();
 
 watch(selectedAccount, newVal => {
-  switchTableData(newVal!.fakeid).catch(() => {});
+  if (!newVal) {
+    globalRowData = [];
+    gridApi.value?.setGridOption('rowData', globalRowData);
+    return;
+  }
+  switchTableData(newVal.fakeid).catch(() => {});
 });
 
 async function switchTableData(fakeid: string) {
   loading.value = true;
+  await loadLocalExportRecords();
   const articles: Article[] = [];
   const data = await getArticleCache(fakeid, Math.floor(Date.now() / 1000));
   for (const article of data) {
     const contentDownload = (await getHtmlCache(article.link)) !== undefined;
     const commentDownload = (await getCommentCache(article.link)) !== undefined;
     const metadata = await getMetadataCache(article.link);
+    const localExport = findLocalExportRecord(article);
     if (metadata) {
       articles.push({
         ...metadata,
         ...article,
         contentDownload: contentDownload,
         commentDownload: commentDownload,
+        markdownExported: !!localExport,
+        markdownPath: localExport?.filepath,
+        articleDir: localExport?.articleDir,
       });
     } else {
       articles.push({
         ...article,
         contentDownload: contentDownload,
         commentDownload: commentDownload,
+        markdownExported: !!localExport,
+        markdownPath: localExport?.filepath,
+        articleDir: localExport?.articleDir,
       });
     }
   }
   await sleep(200);
   globalRowData = articles.filter(article => (hideDeleted.value ? !article.is_deleted : true));
   gridApi.value?.setGridOption('rowData', globalRowData);
+  applyTitleKeywordFilter();
   loading.value = false;
+}
+
+async function loadLocalExportRecords(force = false) {
+  if (localExportLoaded.value && !force) return;
+
+  localExportLoading.value = true;
+  try {
+    const data = await $fetch<{
+      success: boolean;
+      records: Wechat2mdManifestEntry[];
+    }>('/api/local/wechat2md-manifest');
+    localExportRecords.value = data.success ? data.records || [] : [];
+    localExportLoaded.value = data.success;
+  } catch (error) {
+    console.warn('读取本地 Markdown 导出记录失败', error);
+    localExportRecords.value = [];
+    localExportLoaded.value = false;
+  } finally {
+    localExportLoading.value = false;
+  }
+}
+
+function normalizeText(value?: string | null) {
+  return String(value || '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function normalizeUrlForMatch(value?: string | null) {
+  if (!value) return '';
+  try {
+    const url = new URL(value);
+    url.hash = '';
+    url.searchParams.sort();
+    return url.toString();
+  } catch {
+    return normalizeText(value);
+  }
+}
+
+const localExportByUrl = computed(() => {
+  const index = new Map<string, Wechat2mdManifestEntry>();
+  for (const record of localExportRecords.value) {
+    const key = normalizeUrlForMatch(record.url);
+    if (key) index.set(key, record);
+  }
+  return index;
+});
+
+const localExportByAccountTitle = computed(() => {
+  const index = new Map<string, Wechat2mdManifestEntry>();
+  for (const record of localExportRecords.value) {
+    const accountName = normalizeText(record.accountName);
+    const title = normalizeText(record.title);
+    if (accountName && title) {
+      index.set(`${accountName}\u0000${title}`, record);
+    }
+  }
+  return index;
+});
+
+const localExportByUniqueTitle = computed(() => {
+  const index = new Map<string, Wechat2mdManifestEntry>();
+  const duplicated = new Set<string>();
+  for (const record of localExportRecords.value) {
+    const title = normalizeText(record.title);
+    if (!title) continue;
+    if (index.has(title)) {
+      duplicated.add(title);
+    } else {
+      index.set(title, record);
+    }
+  }
+  for (const title of duplicated) {
+    index.delete(title);
+  }
+  return index;
+});
+
+function findLocalExportRecord(article: Pick<Article, 'link' | 'title'>): Wechat2mdManifestEntry | undefined {
+  const urlMatch = localExportByUrl.value.get(normalizeUrlForMatch(article.link));
+  if (urlMatch) return urlMatch;
+
+  const title = normalizeText(article.title);
+  const accountName = normalizeText(selectedAccount.value?.nickname);
+  if (accountName && title) {
+    const accountTitleMatch = localExportByAccountTitle.value.get(`${accountName}\u0000${title}`);
+    if (accountTitleMatch) return accountTitleMatch;
+  }
+
+  return localExportByUniqueTitle.value.get(title);
+}
+
+function refreshLocalExportStatus() {
+  for (const article of globalRowData) {
+    const localExport = findLocalExportRecord(article);
+    article.markdownExported = !!localExport;
+    article.markdownPath = localExport?.filepath;
+    article.articleDir = localExport?.articleDir;
+  }
+  gridApi.value?.setGridOption('rowData', globalRowData);
+  applyTitleKeywordFilter();
+}
+
+async function reloadLocalExportStatus() {
+  await loadLocalExportRecords(true);
+  refreshLocalExportStatus();
 }
 
 function updateRow(article: Article) {
@@ -407,6 +597,22 @@ function onSelectionChanged(event: SelectionChangedEvent) {
 }
 const selectedArticleUrls = computed(() => {
   return selectedArticles.value.map(article => article.link);
+});
+const selectedWechat2mdMetadata = computed<Wechat2mdMetadataMap>(() => {
+  const accountName = selectedAccount.value?.nickname?.trim();
+  return Object.fromEntries(
+    selectedArticles.value.map(article => [
+      article.link,
+      {
+        title: article.title,
+        accountName,
+        canonicalUrl: article.canonical_link,
+        publishDate: article.update_time ? formatTimeStamp(article.update_time) : undefined,
+        markdownExported: article.markdownExported,
+        contentCached: article.contentDownload,
+      },
+    ])
+  );
 });
 const contentNotDownloadedCount = computed(() => {
   return selectedArticles.value.filter(article => !article.contentDownload).length;
@@ -465,7 +671,7 @@ const {
       article.commentNum = metadata.commentNum;
 
       if ((preferences.value as unknown as Preferences).downloadConfig.metadataOverrideContent) {
-        // 如果同步下载文章内容，则更新相关字段
+        // 如果同步阅读量时覆盖正文缓存，则更新相关字段
         article.contentDownload = true;
         article._status = '正常';
         updateArticleStatus(url, '正常');
@@ -492,12 +698,49 @@ const {
 });
 
 const {
-  loading: exportBtnLoading,
-  phase: exportPhase,
-  completed_count: exportCompletedCount,
-  total_count: exportTotalCount,
-  exportFile,
-} = useExporter();
+  wechat2mdMode,
+  mdImageMode,
+  exportFormat,
+  wechat2mdLoading,
+  exportBtnLoading,
+  exportPhase,
+  exportCompletedCount,
+  exportTotalCount,
+  runDownload,
+} = useDownloadOptions();
+
+const exportActionLabel = computed(() => {
+  return exportFormat.value === 'markdown' ? '导出未导出' : '导出文件';
+});
+
+function getMarkdownTargetArticles(forceMarkdown: boolean) {
+  if (exportFormat.value !== 'markdown') return [];
+  return selectedArticles.value.filter(article => forceMarkdown || !article.markdownExported);
+}
+
+async function ensureMarkdownContentCached(forceMarkdown: boolean) {
+  const missing = getMarkdownTargetArticles(forceMarkdown).filter(article => !article.contentDownload);
+  if (missing.length === 0) return;
+
+  await download(
+    'html',
+    missing.map(article => article.link)
+  );
+}
+
+async function runSelectedDownload(forceMarkdown: boolean | Event = false) {
+  const shouldForceMarkdown = forceMarkdown === true;
+  if (exportFormat.value === 'markdown') {
+    await ensureMarkdownContentCached(shouldForceMarkdown);
+  }
+  await runDownload(selectedArticleUrls.value, contentNotDownloadedCount.value, selectedWechat2mdMetadata.value, {
+    forceMarkdown: shouldForceMarkdown,
+    requireCacheForMarkdown: true,
+  });
+  if (exportFormat.value === 'markdown') {
+    await reloadLocalExportStatus();
+  }
+}
 
 async function debug() {
   const cache = await getDebugCache('https://mp.weixin.qq.com/s/0IEaqpJIBGykHFKqj-7xqw');
@@ -530,19 +773,44 @@ function copyWechatLink() {
 
     <div class="flex flex-col h-full divide-y divide-gray-200">
       <!-- 顶部筛选与操作区 -->
-      <header class="flex flex-col items-start lg:flex-row lg:items-center lg:justify-between gap-2 px-3 py-2">
-        <div class="flex flex-col xl:flex-row gap-2">
-          <div class="flex space-x-3">
-            <AccountSelectorForArticle v-model="selectedAccount" class="w-80" />
-          </div>
+      <header class="flex flex-col gap-3 px-3 py-2">
+        <div class="flex flex-col gap-2 md:flex-row md:items-center">
+          <AccountSelectorForArticle v-model="selectedAccount" class="w-full shrink-0 md:w-80" />
+          <UInput
+            v-model="titleKeyword"
+            icon="i-heroicons-magnifying-glass-20-solid"
+            color="white"
+            class="w-full min-w-0 md:w-96"
+            placeholder="按标题关键词过滤"
+            :disabled="!selectedAccount"
+            aria-label="按标题关键词过滤"
+            @keydown.esc="clearTitleKeyword"
+          >
+            <template #trailing>
+              <UButton
+                v-if="titleKeyword"
+                color="gray"
+                variant="ghost"
+                icon="i-heroicons-x-mark-20-solid"
+                size="xs"
+                :padded="false"
+                aria-label="清空标题关键词"
+                @mousedown.prevent
+                @click="clearTitleKeyword"
+              />
+            </template>
+          </UInput>
         </div>
-        <div class="flex items-center space-x-2">
-          <UButton v-if="downloadBtnLoading" color="black" @click="stopDownload">停止</UButton>
+        <div class="flex flex-wrap items-center gap-2">
+          <UButton v-if="downloadBtnLoading" color="black" class="shrink-0 whitespace-nowrap" @click="stopDownload">
+            停止
+          </UButton>
           <ButtonGroup
+            class="shrink-0"
             :items="[
-              { label: '文章内容', event: 'download-article-html' },
-              { label: '阅读量 (需要Credential)', event: 'download-article-metadata' },
-              { label: '留言内容 (需要Credential)', event: 'download-article-comment' },
+              { label: '缓存正文', event: 'download-article-html' },
+              { label: '同步阅读量 (需要Credential)', event: 'download-article-metadata' },
+              { label: '同步留言 (需要Credential)', event: 'download-article-comment' },
             ]"
             @download-article-html="download('html', selectedArticleUrls)"
             @download-article-metadata="download('metadata', selectedArticleUrls)"
@@ -552,48 +820,121 @@ function copyWechatLink() {
               :loading="downloadBtnLoading"
               :disabled="!selectedAccount"
               color="white"
-              class="font-mono"
-              :label="downloadBtnLoading ? `抓取中 ${downloadCompletedCount}/${downloadTotalCount}` : '抓取'"
+              class="font-mono whitespace-nowrap"
+              :label="downloadBtnLoading ? `缓存中 ${downloadCompletedCount}/${downloadTotalCount}` : '缓存正文'"
               trailing-icon="i-heroicons-chevron-down-20-solid"
             />
           </ButtonGroup>
 
           <ButtonGroup
+            class="shrink-0"
             :items="[
-              { label: 'Excel', event: 'export-article-excel' },
-              { label: 'JSON', event: 'export-article-json' },
-              { label: 'HTML', event: 'export-article-html' },
-              { label: 'Txt', event: 'export-article-text' },
-              { label: 'Markdown', event: 'export-article-markdown' },
-              { label: 'Word (内测中)', event: 'export-article-word' },
-              { label: 'PDF (内测中)', event: 'export-article-pdf' },
+              { label: '轻量版 (fetch)', event: 'select-lite' },
+              { label: 'Playwright 版', event: 'select-playwright' },
             ]"
-            @export-article-excel="exportFile('excel', selectedArticleUrls)"
-            @export-article-json="exportFile('json', selectedArticleUrls)"
-            @export-article-html="exportFile('html', selectedArticleUrls, contentNotDownloadedCount)"
-            @export-article-text="exportFile('text', selectedArticleUrls, contentNotDownloadedCount)"
-            @export-article-markdown="exportFile('markdown', selectedArticleUrls, contentNotDownloadedCount)"
-            @export-article-word="exportFile('word', selectedArticleUrls, contentNotDownloadedCount)"
-            @export-article-pdf="exportFile('pdf', selectedArticleUrls, contentNotDownloadedCount)"
+            @select-lite="wechat2mdMode = 'lite'"
+            @select-playwright="wechat2mdMode = 'playwright'"
           >
             <UButton
-              :loading="exportBtnLoading"
-              :disabled="!selectedAccount"
-              color="white"
-              class="font-mono"
-              :label="exportBtnLoading ? `${exportPhase} ${exportCompletedCount}/${exportTotalCount}` : '导出'"
+              color="teal"
+              variant="soft"
+              class="whitespace-nowrap"
+              :label="WECHAT2MD_MODE_LABELS[wechat2mdMode]"
               trailing-icon="i-heroicons-chevron-down-20-solid"
             />
           </ButtonGroup>
+
+          <ButtonGroup
+            class="shrink-0"
+            :items="[
+              { label: 'Excel', event: 'fmt-excel' },
+              { label: 'JSON', event: 'fmt-json' },
+              { label: 'HTML', event: 'fmt-html' },
+              { label: 'Txt', event: 'fmt-text' },
+              { label: 'Markdown', event: 'fmt-markdown' },
+              { label: 'Word (内测中)', event: 'fmt-word' },
+              { label: 'PDF (内测中)', event: 'fmt-pdf' },
+            ]"
+            @fmt-excel="exportFormat = 'excel'"
+            @fmt-json="exportFormat = 'json'"
+            @fmt-html="exportFormat = 'html'"
+            @fmt-text="exportFormat = 'text'"
+            @fmt-markdown="exportFormat = 'markdown'"
+            @fmt-word="exportFormat = 'word'"
+            @fmt-pdf="exportFormat = 'pdf'"
+          >
+            <UButton
+              :loading="exportBtnLoading"
+              color="white"
+              class="font-mono whitespace-nowrap"
+              :label="exportBtnLoading ? `${exportPhase} ${exportCompletedCount}/${exportTotalCount}` : EXPORT_FORMAT_LABELS[exportFormat]"
+              trailing-icon="i-heroicons-chevron-down-20-solid"
+            />
+          </ButtonGroup>
+
+          <ButtonGroup
+            v-if="exportFormat === 'markdown'"
+            class="shrink-0"
+            :items="[
+              { label: '图片下载到本地', event: 'img-indexed' },
+              { label: '图片 Base64 内嵌', event: 'img-base64' },
+              { label: '保留 CDN 链接', event: 'img-cdn' },
+            ]"
+            @img-indexed="mdImageMode = 'indexed'"
+            @img-base64="mdImageMode = 'base64'"
+            @img-cdn="mdImageMode = 'cdn'"
+          >
+            <UButton
+              color="white"
+              variant="soft"
+              class="whitespace-nowrap"
+              :label="MD_IMAGE_MODE_LABELS[mdImageMode]"
+              trailing-icon="i-heroicons-chevron-down-20-solid"
+            />
+          </ButtonGroup>
+
+          <UButton
+            color="primary"
+            class="shrink-0 whitespace-nowrap"
+            :loading="wechat2mdLoading || exportBtnLoading"
+            :disabled="!selectedAccount || selectedArticleUrls.length === 0"
+            @click="runSelectedDownload()"
+          >
+            {{ wechat2mdLoading ? 'wechat2md...' : exportBtnLoading ? '导出中...' : exportActionLabel }}
+          </UButton>
+
+          <UButton
+            v-if="exportFormat === 'markdown'"
+            color="amber"
+            variant="soft"
+            icon="i-lucide:refresh-cw"
+            class="shrink-0 whitespace-nowrap"
+            :loading="wechat2mdLoading"
+            :disabled="!selectedAccount || selectedArticleUrls.length === 0 || exportBtnLoading"
+            label="覆盖导出"
+            @click="runSelectedDownload(true)"
+          />
+
+          <UButton
+            :loading="localExportLoading"
+            :disabled="!selectedAccount"
+            icon="i-lucide:folder-sync"
+            label="刷新本地导出状态"
+            class="shrink-0 whitespace-nowrap"
+            color="emerald"
+            variant="soft"
+            @click="reloadLocalExportStatus"
+          />
 
           <UButton
             :disabled="!selectedAccount"
             :icon="copied ? 'i-lucide:check' : 'i-heroicons-link-16-solid'"
             label="复制公众号链接"
             :color="copied ? 'green' : 'blue'"
+            class="shrink-0 whitespace-nowrap"
             @click="copyWechatLink"
           />
-          <UButton v-if="isDev" @click="debug">调试</UButton>
+          <UButton v-if="isDev" class="shrink-0 whitespace-nowrap" @click="debug">调试</UButton>
         </div>
       </header>
 

@@ -14,10 +14,10 @@ interface Props {
 const props = defineProps<Props>();
 
 function sync() {
-  props.params.onSync && props.params.onSync(props.params);
+  props.params.onSync?.(props.params);
 }
 function stop() {
-  props.params.onStop && props.params.onStop(props.params);
+  props.params.onStop?.(props.params);
 }
 const isDisabled = computed(() => props.params.isDeleting || props.params.isSyncing);
 const isLoading = computed(() => props.params.isSyncing && props.params.node.id === props.params.syncingRowId);
@@ -29,13 +29,17 @@ const isLoading = computed(() => props.params.isSyncing && props.params.node.id 
       <Loader :size="14" class="animate-spin" />
       停止</UButton
     >
-    <UButton
-      v-else
-      icon="i-heroicons:arrow-path-rounded-square-20-solid"
-      color="blue"
-      size="xs"
-      :disabled="isDisabled"
-      @click="sync"
-    ></UButton>
+    <template v-else>
+      <UTooltip text="增量同步">
+        <UButton
+          icon="i-heroicons:arrow-path-rounded-square-20-solid"
+          color="blue"
+          size="xs"
+          aria-label="增量同步"
+          :disabled="isDisabled"
+          @click="sync"
+        />
+      </UTooltip>
+    </template>
   </div>
 </template>

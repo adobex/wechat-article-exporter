@@ -141,6 +141,7 @@ export interface AppMsgEx {
   author_name: string;
   ban_flag: number;
   checking: number;
+  canonical_link?: string;
   copyright_stat: number;
   copyright_type: number;
   cover: string;

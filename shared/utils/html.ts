@@ -1,5 +1,54 @@
+import { parse, parseExpressionAt } from 'acorn';
 import * as cheerio from 'cheerio';
 import { extractCommentId } from '~/utils/comment';
+
+const ACTIVE_CONTENT_ELEMENTS = 'script, object, embed, base, meta[http-equiv="refresh" i]';
+const URL_ATTRIBUTES = new Set(['action', 'formaction', 'href', 'poster', 'src', 'xlink:href']);
+
+function compactHtmlUrl(value: string): string {
+  return Array.from(value, character => (character.charCodeAt(0) <= 0x20 ? '' : character)).join('');
+}
+
+function isUnsafeHtmlUrl(tagName: string, attributeName: string, value: string): boolean {
+  const compact = compactHtmlUrl(value).toLowerCase();
+  if (compact.startsWith('javascript:') || compact.startsWith('vbscript:')) return true;
+  if (!compact.startsWith('data:')) return false;
+  return !(tagName === 'img' && attributeName === 'src' && compact.startsWith('data:image/'));
+}
+
+function sanitizeLoadedHtml($: cheerio.CheerioAPI): void {
+  $(ACTIVE_CONTENT_ELEMENTS).remove();
+  $('*').each((_index, element) => {
+    const node = $(element);
+    const tagName = String((element as { name?: string }).name || '').toLowerCase();
+    for (const [rawName, value] of Object.entries((element as { attribs?: Record<string, string> }).attribs || {})) {
+      const name = rawName.toLowerCase();
+      if (name.startsWith('on') || name === 'srcdoc') {
+        node.removeAttr(rawName);
+        continue;
+      }
+      if (URL_ATTRIBUTES.has(name) && isUnsafeHtmlUrl(tagName, name, value)) {
+        node.removeAttr(rawName);
+        continue;
+      }
+      if (name === 'srcset' && /(?:javascript|vbscript|data):/i.test(compactHtmlUrl(value))) {
+        node.removeAttr(rawName);
+      }
+    }
+
+    if (tagName === 'iframe') {
+      node.attr('sandbox', '');
+      node.attr('referrerpolicy', 'no-referrer');
+      node.removeAttr('allow');
+    }
+  });
+}
+
+export function sanitizeWechatHtmlDocument(rawHtml: string): string {
+  const $ = cheerio.load(rawHtml);
+  sanitizeLoadedHtml($);
+  return `<!DOCTYPE html>\n${$.html()}`;
+}
 
 /**
  * 处理文章的 html 内容
@@ -27,7 +76,7 @@ export function normalizeHtml(rawHTML: string, format: 'html' | 'text' = 'html')
   $jsArticleContent.find('#wx_stream_article_slide_tip').remove();
 
   // 处理图片懒加载（全局处理所有 img）
-  $('img').each((i, el) => {
+  $('img').each((_i, el) => {
     const $img = $(el);
     const imgUrl = $img.attr('src') || $img.attr('data-src');
     if (imgUrl) {
@@ -47,9 +96,9 @@ export function normalizeHtml(rawHTML: string, format: 'html' | 'text' = 'html')
     return filteredLines.join('\n');
   } else if (format === 'html') {
     // 获取修改后的 HTML
-    let bodyCls = $('body').attr('class');
+    const bodyCls = $('body').attr('class');
     const pageContentHTML = $('<div>').append($jsArticleContent.clone()).html();
-    return `<!DOCTYPE html>
+    return sanitizeWechatHtmlDocument(`<!DOCTYPE html>
   <html lang="zh_CN">
   <head>
       <meta charset="utf-8">
@@ -86,7 +135,7 @@ export function normalizeHtml(rawHTML: string, format: 'html' | 'text' = 'html')
   ${pageContentHTML}
   </body>
   </html>
-    `;
+    `);
   } else {
     throw new Error(`format not supported: ${format}`);
   }
@@ -123,84 +172,289 @@ export function validateHTMLContent(html: string): ['Success' | 'Deleted' | 'Exc
   }
 }
 
-/**
- * 提取 window.cgiDataNew 所在脚本的代码
- * @param html 文章的完整 html 内容
- * @return 脚本代码 (纯代码，不含 <script> 标签)
- * @remarks 内部使用 cheerio 库进行解析，可运行在浏览器端和服务器端。
- */
-function extractCgiScript(html: string) {
-  const $ = cheerio.load(html);
-
-  const scriptEl = $('script[type="text/javascript"][h5only]').filter((i, el) => {
-    const content = $(el).html() || '';
-    return content.includes('window.cgiDataNew = {');
-  });
-
-  if (scriptEl.length !== 1) {
-    console.warn('未找到包含 cgiDataNew 的目标 script');
-    return null;
-  }
-
-  return scriptEl.html()?.trim() || null;
+type ScriptPrimitive = string | number | boolean | null | undefined;
+export type SafeScriptValue = ScriptPrimitive | SafeScriptValue[] | SafeScriptRecord;
+export interface SafeScriptRecord {
+  [key: string]: SafeScriptValue;
 }
 
-/**
- * 从 html 中提取 cgiDataNew 对象
- * @param html 文章的完整 html 内容
- * @return window.cgiDataNew 对象，解析失败时返回 null
- */
-function parseCgiDataNewOnClient(html: string): Promise<any> {
-  const code = extractCgiScript(html);
-  if (!code) {
-    return Promise.resolve(null);
-  }
-
-  const iframe = document.createElement('iframe');
-  iframe.style.display = 'none';
-  iframe.srcdoc = `<script type="text/javascript">${code}</script>`;
-  document.body.appendChild(iframe);
-
-  return new Promise((resolve, reject) => {
-    iframe.onload = function () {
-      // @ts-ignore
-      const data = iframe.contentWindow.cgiDataNew;
-
-      // 用完后清理
-      document.body.removeChild(iframe);
-      resolve(data);
-    };
-    iframe.onerror = function (e) {
-      reject(e);
-    };
-  });
+interface AstNode {
+  type: string;
+  start: number;
+  end: number;
+  [key: string]: unknown;
 }
 
-/**
- * 从 html 中提取 cgiDataNew 对象（服务端）。
- * 用 QuickJS-WASM 沙箱在主 Worker 内执行 cgi 脚本（node / CF workerd 通用），不再依赖 Dynamic Workers。
- * @param html 文章的完整 html 内容
- * @return window.cgiDataNew 对象，解析失败时返回 null
- */
-async function parseCgiDataNewOnServer(html: string): Promise<any> {
-  const code = extractCgiScript(html);
-  if (!code) {
-    return null;
+interface ParsedScriptValue {
+  value: SafeScriptValue;
+  end: number;
+}
+
+const MAX_SCRIPT_LENGTH = 8 * 1024 * 1024;
+const MAX_AST_DEPTH = 128;
+const MAX_AST_NODES = 300_000;
+const FORBIDDEN_OBJECT_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+function decodeWechatString(value: string): string {
+  return value
+    .replace(/\\x22/g, '"')
+    .replace(/\\x26/g, '&')
+    .replace(/\\x27/g, "'")
+    .replace(/\\x3c/gi, '<')
+    .replace(/\\x3e/gi, '>')
+    .replace(/\\x0a/gi, '\n');
+}
+
+function decodeWechatHtmlString(value: string): string {
+  return cheerio.load(`<body>${value}</body>`)('body').text();
+}
+
+function readObjectKey(node: AstNode): string {
+  if (node.type === 'Identifier' && typeof node.name === 'string') {
+    return node.name;
+  }
+  if (node.type === 'Literal' && ['string', 'number'].includes(typeof node.value)) {
+    return String(node.value);
+  }
+  throw new Error('Unsupported object key');
+}
+
+function interpretScriptNode(node: AstNode, state: { nodes: number }, depth = 0): SafeScriptValue {
+  state.nodes += 1;
+  if (depth > MAX_AST_DEPTH || state.nodes > MAX_AST_NODES) {
+    throw new Error('Script literal exceeds parser limits');
   }
 
-  try {
-    // 仅服务端动态引入沙箱，避免 QuickJS wasm 被打进客户端 SPA bundle（客户端走 iframe 路径）。
-    // 用 !process.client 作守卫：客户端构建时 process.client=true → 该分支被静态消除（wasm 不进客户端）；
-    // 服务端(Nitro/workerd) 及纯 node 测试环境下条件为真 → 正常执行。
-    if (!process.client) {
-      const { evalCgiViaQuickJS } = await import('./cgi-sandbox');
-      return await evalCgiViaQuickJS(code);
+  if (node.type === 'Literal') {
+    const value = node.value;
+    if (value === null || ['string', 'number', 'boolean'].includes(typeof value)) {
+      return value as ScriptPrimitive;
     }
-    return null;
-  } catch (error) {
-    console.error(error);
+    throw new Error('Unsupported literal');
+  }
+
+  if (node.type === 'Identifier') {
+    if (node.name === 'undefined') return undefined;
+    throw new Error('Unsupported identifier');
+  }
+
+  if (node.type === 'ArrayExpression') {
+    const elements = node.elements as Array<AstNode | null>;
+    if (elements.some(element => element === null)) {
+      throw new Error('Sparse arrays are not supported');
+    }
+    return elements.map(element => {
+      if (!element) throw new Error('Sparse arrays are not supported');
+      return interpretScriptNode(element, state, depth + 1);
+    });
+  }
+
+  if (node.type === 'ObjectExpression') {
+    const result: Record<string, SafeScriptValue> = {};
+    for (const propertyNode of node.properties as AstNode[]) {
+      if (propertyNode.type !== 'Property') throw new Error('Object spreads are not supported');
+      if (
+        propertyNode.computed === true ||
+        propertyNode.method === true ||
+        propertyNode.shorthand === true ||
+        propertyNode.kind !== 'init'
+      ) {
+        throw new Error('Unsupported object property');
+      }
+
+      const key = readObjectKey(propertyNode.key as AstNode);
+      if (FORBIDDEN_OBJECT_KEYS.has(key) || Object.hasOwn(result, key)) {
+        throw new Error('Unsafe or duplicate object key');
+      }
+      result[key] = interpretScriptNode(propertyNode.value as AstNode, state, depth + 1);
+    }
+    return result;
+  }
+
+  if (node.type === 'CallExpression') {
+    const callee = node.callee as AstNode;
+    const args = node.arguments as AstNode[];
+    if (
+      callee.type !== 'Identifier' ||
+      !['JsDecode', 'htmlDecode'].includes(String(callee.name)) ||
+      args.length !== 1
+    ) {
+      throw new Error('Unsupported function call');
+    }
+    const value = interpretScriptNode(args[0], state, depth + 1);
+    if (typeof value !== 'string') throw new Error(`${String(callee.name)} only accepts a string literal`);
+    return callee.name === 'htmlDecode' ? decodeWechatHtmlString(value) : decodeWechatString(value);
+  }
+
+  if (node.type === 'BinaryExpression') {
+    if (node.operator !== '*') throw new Error('Unsupported binary expression');
+    const left = interpretScriptNode(node.left as AstNode, state, depth + 1);
+    const right = interpretScriptNode(node.right as AstNode, state, depth + 1);
+    if (!['string', 'number'].includes(typeof left) || right !== 1) {
+      throw new Error('Only numeric coercion by multiplication with 1 is supported');
+    }
+    return Number(left);
+  }
+
+  if (node.type === 'UnaryExpression') {
+    const value = interpretScriptNode(node.argument as AstNode, state, depth + 1);
+    if (typeof value !== 'number' || !['+', '-'].includes(String(node.operator))) {
+      throw new Error('Unsupported unary expression');
+    }
+    return node.operator === '-' ? -value : value;
+  }
+
+  throw new Error(`Unsupported script node: ${node.type}`);
+}
+
+function parseScriptValueAt(source: string, start: number): ParsedScriptValue {
+  if (source.length > MAX_SCRIPT_LENGTH) throw new Error('Script is too large');
+  const node = parseExpressionAt(source, start, { ecmaVersion: 'latest' }) as AstNode;
+  return {
+    value: interpretScriptNode(node, { nodes: 0 }),
+    end: node.end,
+  };
+}
+
+function skipScriptTrivia(source: string, start: number): number {
+  let cursor = start;
+  while (cursor < source.length) {
+    if (/\s/.test(source[cursor])) {
+      cursor += 1;
+      continue;
+    }
+    if (source.startsWith('//', cursor)) {
+      const lineEnd = source.indexOf('\n', cursor + 2);
+      return lineEnd === -1 ? source.length : skipScriptTrivia(source, lineEnd + 1);
+    }
+    if (source.startsWith('/*', cursor)) {
+      const commentEnd = source.indexOf('*/', cursor + 2);
+      if (commentEnd === -1) return source.length;
+      cursor = commentEnd + 2;
+      continue;
+    }
+    break;
+  }
+  return cursor;
+}
+
+function hasMarkerBoundary(source: string, marker: string, index: number): boolean {
+  const before = source[index - 1] || '';
+  const after = source[index + marker.length] || '';
+  return !/[\w$]/.test(before) && !/[\w$]/.test(after);
+}
+
+export function extractWechatScriptAssignment(source: string, marker: string): SafeScriptValue | null {
+  let searchFrom = 0;
+  while (searchFrom < source.length) {
+    const markerIndex = source.indexOf(marker, searchFrom);
+    if (markerIndex === -1) return null;
+    searchFrom = markerIndex + marker.length;
+    if (!hasMarkerBoundary(source, marker, markerIndex)) continue;
+
+    let cursor = skipScriptTrivia(source, searchFrom);
+    if (source[cursor] !== '=' || ['=', '>'].includes(source[cursor + 1] || '')) continue;
+    cursor = skipScriptTrivia(source, cursor + 1);
+
+    try {
+      return parseScriptValueAt(source, cursor).value;
+    } catch {
+      // Continue looking in case the marker appeared in a comment or unrelated statement.
+    }
+  }
+  return null;
+}
+
+function isNicknameAssignmentTarget(node: AstNode): boolean {
+  if (node.type === 'Identifier') return node.name === 'nickname';
+  if (node.type !== 'MemberExpression' || node.computed === true) return false;
+  const object = node.object as AstNode;
+  const property = node.property as AstNode;
+  return (
+    object.type === 'Identifier' &&
+    ['window', 'globalThis'].includes(String(object.name)) &&
+    property.type === 'Identifier' &&
+    property.name === 'nickname'
+  );
+}
+
+function extractTopLevelNicknameAssignment(source: string): SafeScriptValue | null {
+  if (source.length > MAX_SCRIPT_LENGTH) return null;
+  try {
+    const program = parse(source, {
+      ecmaVersion: 'latest',
+      sourceType: 'script',
+      allowHashBang: true,
+    }) as unknown as AstNode;
+    for (const statement of program.body as AstNode[]) {
+      if (statement.type === 'VariableDeclaration') {
+        for (const declaration of statement.declarations as AstNode[]) {
+          const identifier = declaration.id as AstNode;
+          const initializer = declaration.init as AstNode | null;
+          if (identifier?.type === 'Identifier' && identifier.name === 'nickname' && initializer) {
+            return interpretScriptNode(initializer, { nodes: 0 });
+          }
+        }
+      }
+
+      if (statement.type === 'ExpressionStatement') {
+        const expression = statement.expression as AstNode;
+        if (
+          expression?.type === 'AssignmentExpression' &&
+          expression.operator === '=' &&
+          isNicknameAssignmentTarget(expression.left as AstNode)
+        ) {
+          return interpretScriptNode(expression.right as AstNode, { nodes: 0 });
+        }
+      }
+    }
+  } catch {
     return null;
   }
+  return null;
+}
+
+export function extractWechatScriptCallArguments(source: string, marker: string): SafeScriptValue[] {
+  const values: SafeScriptValue[] = [];
+  let searchFrom = 0;
+  while (searchFrom < source.length) {
+    const markerIndex = source.indexOf(marker, searchFrom);
+    if (markerIndex === -1) break;
+    searchFrom = markerIndex + marker.length;
+    if (!hasMarkerBoundary(source, marker, markerIndex)) continue;
+
+    let cursor = skipScriptTrivia(source, searchFrom);
+    if (source[cursor] !== '(') continue;
+    cursor = skipScriptTrivia(source, cursor + 1);
+
+    try {
+      const parsed = parseScriptValueAt(source, cursor);
+      const closeParen = skipScriptTrivia(source, parsed.end);
+      if (source[closeParen] !== ')') continue;
+      values.push(parsed.value);
+      searchFrom = closeParen + 1;
+    } catch {
+      // Ignore non-literal calls and continue scanning the script.
+    }
+  }
+  return values;
+}
+
+/**
+ * Extract the account nickname from current and legacy WeChat article markup.
+ */
+export function extractWechatAccountName(rawHtml: string): string {
+  const $ = cheerio.load(rawHtml);
+  for (const script of $('script').toArray()) {
+    const source = $(script).html() || '';
+    if (!source.includes('nickname')) continue;
+    const value = extractTopLevelNicknameAssignment(source);
+    if (typeof value === 'string' && value.trim()) {
+      return value.trim();
+    }
+  }
+
+  return $('.wx_follow_nickname, .account_nickname_inner').first().text().trim();
 }
 
 /**
@@ -208,10 +462,16 @@ async function parseCgiDataNewOnServer(html: string): Promise<any> {
  * @param html 文章的完整 html 内容
  * @return window.cgiDataNew 对象，解析失败时返回 null
  */
-export async function parseCgiDataNew(html: string): Promise<any> {
-  if (process.client && typeof document === 'object') {
-    return parseCgiDataNewOnClient(html);
-  } else {
-    return parseCgiDataNewOnServer(html);
+export async function parseCgiDataNew(html: string): Promise<SafeScriptRecord | null> {
+  const $ = cheerio.load(html);
+  for (const script of $('script').toArray()) {
+    const source = $(script).html() || '';
+    if (!source.includes('window.cgiDataNew')) continue;
+
+    const value = extractWechatScriptAssignment(source, 'window.cgiDataNew');
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      return value as SafeScriptRecord;
+    }
   }
+  return null;
 }

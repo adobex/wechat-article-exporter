@@ -5,7 +5,7 @@ import { Downloader } from '~/utils/download/Downloader';
 import type { DownloaderStatus } from '~/utils/download/types';
 
 export interface DownloadArticleOptions {
-  // 文章内容下载成功回调
+  // 文章正文缓存成功回调
   onContent: (url: string) => void;
 
   // 文章状态异常回调(不含「已删除」)
@@ -14,10 +14,10 @@ export interface DownloadArticleOptions {
   // 文章被删除回调
   onDelete: (url: string) => void;
 
-  // 文章阅读量抓取成功回调
+  // 文章阅读量同步成功回调
   onMetadata: (url: string, metadata: Metadata) => void;
 
-  // 文章留言抓取成功回调
+  // 文章留言同步成功回调
   onComment: (url: string) => void;
 
   // 修复单篇文章下载的 fakeid 专用
@@ -33,7 +33,7 @@ export default (options: Partial<DownloadArticleOptions> = {}) => {
 
   let downloader: Downloader | null = null;
 
-  // 抓取文章内容(html)
+  // 缓存文章正文(html)
   async function downloadArticleHTML(urls: string[]) {
     if (urls.length === 0) {
       toast.warning('提示', '请先选择文章');
@@ -65,24 +65,24 @@ export default (options: Partial<DownloadArticleOptions> = {}) => {
         }
       });
       downloader.on('download:begin', () => {
-        console.debug('开始抓取【文章内容】...');
+        console.debug('开始缓存【文章正文】...');
         completed_count.value = 0;
         total_count.value = urls.length;
       });
       downloader.on('download:finish', (seconds: number, status: DownloaderStatus) => {
         console.debug('耗时:', formatElapsedTime(seconds));
         toast.success(
-          '【文章内容】抓取完成',
-          `本次抓取耗时 ${formatElapsedTime(seconds)}, 成功:${status.completed.length}, 失败:${status.failed.length}, 检测到已被删除:${status.deleted.length}`
+          '【文章正文】缓存完成',
+          `本次缓存耗时 ${formatElapsedTime(seconds)}, 成功:${status.completed.length}, 失败:${status.failed.length}, 检测到已被删除:${status.deleted.length}`
         );
       });
       downloader.on('download:stop', () => {
-        toast.info('HTML下载任务已停止');
+        toast.info('正文缓存任务已停止');
       });
 
       await downloader.startDownload('html');
     } catch (error) {
-      console.error('【文章内容】抓取失败:', error);
+      console.error('【文章正文】缓存失败:', error);
       alert((error as Error).message);
     } finally {
       loading.value = false;
@@ -90,7 +90,7 @@ export default (options: Partial<DownloadArticleOptions> = {}) => {
     }
   }
 
-  // 抓取文章阅读量、点赞量等元数据
+  // 同步文章阅读量、点赞量等元数据
   async function downloadArticleMetadata(urls: string[]) {
     if (urls.length === 0) {
       toast.warning('提示', '请先选择文章');
@@ -124,21 +124,21 @@ export default (options: Partial<DownloadArticleOptions> = {}) => {
         }
       });
       downloader.on('download:begin', () => {
-        console.debug('开始抓取【阅读量】...');
+        console.debug('开始同步【阅读量】...');
         completed_count.value = 0;
         total_count.value = urls.length;
       });
       downloader.on('download:finish', (seconds: number, status: DownloaderStatus) => {
         console.debug('耗时:', formatElapsedTime(seconds));
         toast.success(
-          '【阅读量】抓取完成',
-          `本次抓取耗时 ${formatElapsedTime(seconds)}, 成功:${status.completed.length}, 失败:${status.failed.length}, 检测到已被删除:${status.deleted.length}`
+          '【阅读量】同步完成',
+          `本次同步耗时 ${formatElapsedTime(seconds)}, 成功:${status.completed.length}, 失败:${status.failed.length}, 检测到已被删除:${status.deleted.length}`
         );
       });
 
       await downloader.startDownload('metadata');
     } catch (error) {
-      console.error('【阅读量】抓取失败:', error);
+      console.error('【阅读量】同步失败:', error);
       alert((error as Error).message);
     } finally {
       loading.value = false;
@@ -146,7 +146,7 @@ export default (options: Partial<DownloadArticleOptions> = {}) => {
     }
   }
 
-  // 抓取文章留言数据
+  // 同步文章留言数据
   async function downloadArticleComment(urls: string[]) {
     if (urls.length === 0) {
       toast.warning('提示', '请先选择文章');
@@ -168,21 +168,21 @@ export default (options: Partial<DownloadArticleOptions> = {}) => {
         }
       });
       downloader.on('download:begin', () => {
-        console.debug('开始抓取【留言内容】...');
+        console.debug('开始同步【留言内容】...');
         completed_count.value = 0;
         total_count.value = urls.length;
       });
       downloader.on('download:finish', (seconds: number, status: DownloaderStatus) => {
         console.debug('耗时:', formatElapsedTime(seconds));
         toast.success(
-          '【留言内容】抓取完成',
-          `本次抓取耗时 ${formatElapsedTime(seconds)}, 成功:${status.completed.length}, 失败:${status.failed.length}`
+          '【留言内容】同步完成',
+          `本次同步耗时 ${formatElapsedTime(seconds)}, 成功:${status.completed.length}, 失败:${status.failed.length}`
         );
       });
 
       await downloader.startDownload('comments');
     } catch (error) {
-      console.error('【留言内容】抓取失败:', error);
+      console.error('【留言内容】同步失败:', error);
       alert((error as Error).message);
     } finally {
       loading.value = false;

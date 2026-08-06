@@ -6,9 +6,13 @@ interface DebugQuery {
 
 export default defineEventHandler(async event => {
   const { key } = getQuery<DebugQuery>(event);
-  if (key && key === process.env.DEBUG_KEY) {
-    return cookieStore.toJSON();
-  } else {
-    return 'not set debug key';
+  const debugKey = process.env.DEBUG_KEY;
+  if (!debugKey || typeof key !== 'string' || key !== debugKey) {
+    throw createError({ statusCode: 403, statusMessage: 'Invalid debug key' });
   }
+
+  return {
+    ...cookieStore.getDebugSummary(),
+    mpRequestLoggingEnabled: process.env.NUXT_DEBUG_MP_REQUEST === 'true',
+  };
 });

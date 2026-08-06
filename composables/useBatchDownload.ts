@@ -1,4 +1,4 @@
-import { format } from 'date-fns';
+import dayjs from 'dayjs';
 import { saveAs } from 'file-saver';
 import JSZip from 'jszip';
 import type { DownloadableArticle } from '~/types/types';
@@ -17,7 +17,7 @@ export function useDownloadAlbum() {
     loading.value = true;
 
     try {
-      phase.value = '下载文章内容';
+      phase.value = '缓存文章正文';
       const results = await downloadArticleHTMLs(articles, (count: number) => {
         downloadedCount.value = count;
       });
@@ -29,7 +29,7 @@ export function useDownloadAlbum() {
           article.fakeid,
           article.html!,
           article.title.replaceAll('.', '_'),
-          zip.folder(format(new Date(+article.date * 1000), 'yyyy-MM-dd') + ' ' + article.title.replace(/\//g, '_'))!
+          zip.folder(dayjs(+article.date * 1000).format('YYYY-MM-DD') + ' ' + article.title.replace(/\//g, '_'))!
         );
         packedCount.value++;
       }

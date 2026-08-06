@@ -20,8 +20,11 @@ yarn dev          # 启动开发服务器
 yarn build        # 生产构建（输出到 .output/）
 yarn preview      # 构建 Cloudflare Pages 版本并本地预览
 
-# 代码格式化（Biome 为主要格式化工具，linter 已禁用）
-yarn format       # biome check --write
+# 质量门禁
+yarn format       # 格式化并整理 imports
+yarn quality      # format check + lint + typecheck + tests + high/critical audit
+yarn lint:report  # inspect the full legacy warning backlog
+yarn test         # Vitest 单元测试
 
 # Docker
 yarn docker:build
@@ -61,7 +64,7 @@ Nuxt UI v2 + TailwindCSS 提供组件和样式。AG Grid Enterprise 用于文章
 
 ## 代码规范
 
-- Biome 格式化（非 lint）：行宽 120 字符、2 空格缩进、单引号、ES5 尾逗号、带分号
+- Biome 格式化与 lint：行宽 120 字符、2 空格缩进、单引号、ES5 尾逗号、带分号
 - CSS 使用 4 空格缩进
 - Vue 文件：script/style 标签内不额外缩进
 - 命名：函数/变量使用 camelCase，组件使用 PascalCase

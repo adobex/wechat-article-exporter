@@ -7,7 +7,7 @@ import { updateCommentReplyCache } from '~/store/v2/comment_reply';
 import { updateDebugCache } from '~/store/v2/debug';
 import { getHtmlCache, updateHtmlCache } from '~/store/v2/html';
 import type { Metadata } from '~/store/v2/metadata';
-import { updateMetadataCache } from '~/store/v2/metadata';
+import { getMetadataCache, updateMetadataCache } from '~/store/v2/metadata';
 import type { CommentResponse, ReplyResponse } from '~/types/comment';
 import type { ParsedCredential } from '~/types/credential';
 import type { Preferences } from '~/types/preferences';
@@ -18,6 +18,59 @@ type DownloadType = 'html' | 'metadata' | 'comments' | 'fakeid';
 
 const credentials = useLocalStorage<ParsedCredential[]>('auto-detect-credentials:credentials', []);
 const preferences: Ref<Preferences> = usePreferences() as unknown as Ref<Preferences>;
+
+const METADATA_COUNT_FIELDS = {
+  readNum: 'read_num',
+  oldLikeNum: 'old_like_count',
+  shareNum: 'share_count',
+  likeNum: 'like_count',
+  commentNum: 'comment_count',
+} as const;
+
+type MetadataCounts = Pick<Metadata, keyof typeof METADATA_COUNT_FIELDS>;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function parseCount(value: unknown): number | undefined {
+  if (value === null || value === undefined || value === '') return undefined;
+  const count = Number(value);
+  return Number.isFinite(count) && count >= 0 ? count : undefined;
+}
+
+export function mergeMetadataCounts(cgiData: unknown, existing?: Partial<Metadata>): MetadataCounts {
+  if (!isRecord(cgiData)) throw new Error('无法解析文章元数据');
+  const userInfo = isRecord(cgiData.user_info) ? cgiData.user_info : null;
+  const candidates = [userInfo?.appmsg_bar_data, cgiData.appmsg_bar_data, userInfo, cgiData].filter(isRecord);
+  const result = {} as MetadataCounts;
+  let parsedFieldCount = 0;
+
+  for (const [targetField, sourceField] of Object.entries(METADATA_COUNT_FIELDS) as Array<
+    [keyof MetadataCounts, (typeof METADATA_COUNT_FIELDS)[keyof MetadataCounts]]
+  >) {
+    const parsedValue = candidates
+      .map(candidate => parseCount(candidate[sourceField]))
+      .find(value => value !== undefined);
+    if (parsedValue !== undefined) parsedFieldCount += 1;
+    result[targetField] = parsedValue ?? existing?.[targetField] ?? 0;
+  }
+
+  if (parsedFieldCount === 0) throw new Error('文章响应中不包含可用的阅读量元数据');
+  return result;
+}
+
+function buildCommentEndpoint(
+  action: 'getcomment' | 'getcommentreply',
+  params: Record<string, string | number>
+): string {
+  const target = new URL('https://mp.weixin.qq.com/mp/appmsg_comment');
+  target.search = new URLSearchParams({
+    action,
+    ...Object.fromEntries(Object.entries(params).map(([key, value]) => [key, String(value)])),
+  }).toString();
+  return target.toString();
+}
 
 export class Downloader extends BaseDownloader {
   // 下载的类型
@@ -61,7 +114,7 @@ export class Downloader extends BaseDownloader {
 
   // 处理下载任务队列
   private async processDownloadQueue() {
-    const activePromises: Set<Promise<any>> = new Set();
+    const activePromises: Set<Promise<unknown>> = new Set();
 
     begin: while (this.urls.length > 0 || activePromises.size > 0) {
       // 检查是否需要启动新的下载任务，需同时满足以下两点:
@@ -73,7 +126,8 @@ export class Downloader extends BaseDownloader {
         }
 
         // 启动新的下载任务
-        const url: string = this.urls.pop()!;
+        const url = this.urls.pop();
+        if (!url) break;
         const promise = this.processTask(url);
         activePromises.add(promise);
         promise.finally(() => {
@@ -110,6 +164,7 @@ export class Downloader extends BaseDownloader {
   // 修复单篇文章下载时的虚假fakeid
   private async fixSingleFakeidTask(url: string) {
     this.pending.add(url);
+    const proxyManager = this.getRequestProxyManager(false);
 
     const article = await getSingleArticleByLink(url);
     if (!article) {
@@ -119,22 +174,22 @@ export class Downloader extends BaseDownloader {
     }
 
     for (let attempt = 0; attempt < this.options.maxRetries; attempt++) {
-      const proxy = this.proxyManager.getBestProxy();
+      const proxy = proxyManager.getBestProxy();
 
       try {
         const blob = await this.download(article.fakeid, url, proxy, false);
         const html = await blob.text();
         const cgiData = await parseCgiDataNew(html);
-        if (cgiData && cgiData.bizuin) {
+        if (cgiData?.bizuin) {
           this.emit('fix:fakeid', url, cgiData.bizuin);
 
           this.pending.delete(url);
           this.completed.add(url);
-          this.proxyManager.recordSuccess(proxy);
+          proxyManager.recordSuccess(proxy);
           return;
         }
       } catch (error) {
-        await this.handleDownloadFailure(proxy, url, attempt, error);
+        await this.handleDownloadFailure(proxyManager, proxy, url, attempt, error);
       }
     }
 
@@ -165,9 +220,17 @@ export class Downloader extends BaseDownloader {
 
     // 付费文章需要使用 credential 来获取完整内容
     const withCredential = article.is_pay_subscribe === 1;
+    let proxyManager = this.proxyManager;
+    try {
+      proxyManager = this.getRequestProxyManager(withCredential);
+    } catch (error) {
+      this.pending.delete(url);
+      this.failed.add(url);
+      throw error;
+    }
 
     for (let attempt = 0; attempt < this.options.maxRetries; attempt++) {
-      const proxy = this.proxyManager.getBestProxy();
+      const proxy = proxyManager.getBestProxy();
 
       try {
         const blob = await this.download(article.fakeid, url, proxy, withCredential);
@@ -184,7 +247,7 @@ export class Downloader extends BaseDownloader {
           });
           this.pending.delete(url);
           this.completed.add(url);
-          this.proxyManager.recordSuccess(proxy);
+          proxyManager.recordSuccess(proxy);
           return;
         } else if (status === 'Deleted') {
           // 文章被删除
@@ -194,7 +257,7 @@ export class Downloader extends BaseDownloader {
           this.emit('download:deleted', url);
           this.pending.delete(url);
           this.deleted.add(url);
-          this.proxyManager.recordSuccess(proxy);
+          proxyManager.recordSuccess(proxy);
           return;
         } else if (status === 'Exception' && commentID) {
           // 文章状态异常
@@ -204,7 +267,7 @@ export class Downloader extends BaseDownloader {
           this.emit('download:exception', url, commentID);
           this.pending.delete(url);
           this.failed.add(url);
-          this.proxyManager.recordSuccess(proxy);
+          proxyManager.recordSuccess(proxy);
           return;
         } else if (status === 'Exception' && !commentID) {
           // 文章下载失败(风控导致的)
@@ -230,7 +293,7 @@ export class Downloader extends BaseDownloader {
           throwException(`文章(url: ${url} )解析失败`);
         }
       } catch (error) {
-        await this.handleDownloadFailure(proxy, url, attempt, error);
+        await this.handleDownloadFailure(proxyManager, proxy, url, attempt, error);
       }
     }
 
@@ -250,8 +313,10 @@ export class Downloader extends BaseDownloader {
     }
 
     // 检查 credentials
+    let proxyManager = this.proxyManager;
     try {
       this.validateCredential(article.fakeid);
+      proxyManager = this.getRequestProxyManager(true);
     } catch (error) {
       this.pending.delete(url);
       this.failed.add(url);
@@ -259,7 +324,7 @@ export class Downloader extends BaseDownloader {
     }
 
     for (let attempt = 0; attempt < this.options.maxRetries; attempt++) {
-      const proxy = this.proxyManager.getBestProxy();
+      const proxy = proxyManager.getBestProxy();
 
       try {
         const blob = await this.download(article.fakeid, url, proxy, true);
@@ -281,7 +346,7 @@ export class Downloader extends BaseDownloader {
           }
           this.pending.delete(url);
           this.completed.add(url);
-          this.proxyManager.recordSuccess(proxy);
+          proxyManager.recordSuccess(proxy);
           return;
         } else if (status === 'Deleted') {
           // 文章被删除
@@ -291,7 +356,7 @@ export class Downloader extends BaseDownloader {
           this.emit('download:deleted', url);
           this.pending.delete(url);
           this.deleted.add(url);
-          this.proxyManager.recordSuccess(proxy);
+          proxyManager.recordSuccess(proxy);
           return;
         } else if (status === 'Exception' && commentID) {
           // 文章状态异常，此时 commentID 表示的异常原因
@@ -301,7 +366,7 @@ export class Downloader extends BaseDownloader {
           this.emit('download:exception', url, commentID);
           this.pending.delete(url);
           this.failed.add(url);
-          this.proxyManager.recordSuccess(proxy);
+          proxyManager.recordSuccess(proxy);
           return;
         } else if (status === 'Exception' && !commentID) {
           // 文章下载失败(风控导致的)
@@ -327,7 +392,7 @@ export class Downloader extends BaseDownloader {
           throwException(`文章(url: ${url} )解析失败`);
         }
       } catch (error) {
-        await this.handleDownloadFailure(proxy, url, attempt, error);
+        await this.handleDownloadFailure(proxyManager, proxy, url, attempt, error);
       }
     }
 
@@ -347,8 +412,10 @@ export class Downloader extends BaseDownloader {
     }
 
     // 检查 credentials
+    let proxyManager = this.proxyManager;
     try {
       this.validateCredential(article.fakeid);
+      proxyManager = this.getRequestProxyManager(true);
     } catch (error) {
       this.pending.delete(url);
       this.failed.add(url);
@@ -364,6 +431,12 @@ export class Downloader extends BaseDownloader {
       return;
     }
     const title = cached.title;
+    const commentID = cached.commentID;
+    if (!commentID) {
+      this.pending.delete(url);
+      this.failed.add(url);
+      return;
+    }
 
     // 下载顶级留言
     let buffer = '';
@@ -372,11 +445,18 @@ export class Downloader extends BaseDownloader {
 
     download_comment: while (continue_flag) {
       for (let attempt = 0; attempt < this.options.maxRetries; attempt++) {
-        const proxy = this.proxyManager.getBestProxy();
+        const proxy = proxyManager.getBestProxy();
 
         try {
-          const response = await this.fetchComments(article.fakeid, cached.commentID!, buffer, proxy, article.appmsgid, article.itemidx);
-          this.proxyManager.recordSuccess(proxy);
+          const response = await this.fetchComments(
+            article.fakeid,
+            commentID,
+            buffer,
+            proxy,
+            article.appmsgid,
+            article.itemidx
+          );
+          proxyManager.recordSuccess(proxy);
 
           if (response.base_resp.ret === 0) {
             // 留言下载成功
@@ -386,10 +466,10 @@ export class Downloader extends BaseDownloader {
             continue download_comment;
           } else {
             // 留言下载失败
-            throwException(`文章(url: ${url} )的评论(${cached.commentID})获取失败`);
+            throwException(`文章(url: ${url} )的评论(${commentID})获取失败`);
           }
         } catch (error) {
-          await this.handleDownloadFailure(proxy, url, attempt, error);
+          await this.handleDownloadFailure(proxyManager, proxy, url, attempt, error);
         }
       }
 
@@ -413,19 +493,19 @@ export class Downloader extends BaseDownloader {
 
     download_comment_reply: for (const comment of comments) {
       for (let attempt = 0; attempt < this.options.maxRetries; attempt++) {
-        const proxy = this.proxyManager.getBestProxy();
+        const proxy = proxyManager.getBestProxy();
 
         try {
           const response = await this.fetchCommentReply(
             article.fakeid,
-            cached.commentID!,
+            commentID,
             comment.content_id,
             comment.reply_new.max_reply_id,
             proxy,
             article.appmsgid,
             article.itemidx
           );
-          this.proxyManager.recordSuccess(proxy);
+          proxyManager.recordSuccess(proxy);
 
           if (response.base_resp.ret === 0) {
             // 回复下载成功
@@ -439,10 +519,10 @@ export class Downloader extends BaseDownloader {
             continue download_comment_reply;
           } else {
             // 留言下载失败
-            throwException(`文章(url: ${url} )的评论回复(${cached.commentID})获取失败`);
+            throwException(`文章(url: ${url} )的评论回复(${commentID})获取失败`);
           }
         } catch (error) {
-          await this.handleDownloadFailure(proxy, url, attempt, error);
+          await this.handleDownloadFailure(proxyManager, proxy, url, attempt, error);
         }
       }
 
@@ -469,32 +549,51 @@ export class Downloader extends BaseDownloader {
     this.abortControllers.set(commentID, abortController);
 
     try {
+      this.assertCredentialProxy(proxy);
       // 使用设置的 credentials 来抓取留言
       const targetCredential = credentials.value.find(item => item.biz === fakeid && item.valid);
       if (!targetCredential) {
         throw new Error('目标公众号的 Credential 未设置');
       }
 
-      const Authorization = (preferences.value as Preferences).privateProxyAuthorization || '';
-      const url = `https://mp.weixin.qq.com/mp/appmsg_comment?action=getcomment&scene=0&appmsgid=${appmsgid}&idx=${itemidx}&__biz=${targetCredential.biz}&comment_id=${commentID}&uin=${targetCredential.uin}&key=${targetCredential.key}&pass_ticket=${encodeURIComponent(targetCredential.pass_ticket)}&appmsg_token=${encodeURIComponent(targetCredential.appmsg_token)}&wxtoken=777&devicetype=UnifiedPCMac&comment_scene=0&buffer=${buffer}&offset=0&limit=100&x5=0&f=json`;
+      const url = buildCommentEndpoint('getcomment', {
+        scene: 0,
+        appmsgid,
+        idx: itemidx,
+        __biz: targetCredential.biz,
+        comment_id: commentID,
+        uin: targetCredential.uin,
+        key: targetCredential.key,
+        pass_ticket: targetCredential.pass_ticket,
+        appmsg_token: targetCredential.appmsg_token,
+        wxtoken: 777,
+        devicetype: 'UnifiedPCMac',
+        comment_scene: 0,
+        buffer,
+        offset: 0,
+        limit: 100,
+        x5: 0,
+        f: 'json',
+      });
       const headers: Record<string, string> = {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36 MicroMessenger/6.8.0(0x16080000) NetType/WIFI MiniProgramEnv/Mac MacWechat/WECHAT/WeChatBrowser XWEB/1191',
-        'Referer': 'https://mp.weixin.qq.com/',
+        'User-Agent':
+          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36 MicroMessenger/6.8.0(0x16080000) NetType/WIFI MiniProgramEnv/Mac MacWechat/WECHAT/WeChatBrowser XWEB/1191',
+        Referer: 'https://mp.weixin.qq.com/',
       };
       if (targetCredential.cookie) {
         headers.Cookie = targetCredential.cookie;
       }
-      const proxyUrl = `${proxy}?url=${encodeURIComponent(url)}&headers=${encodeURIComponent(JSON.stringify(headers))}&authorization=${Authorization}`;
+      const proxyUrl = this.buildProxyRequestUrl(proxy, url, headers);
       const response = (await Promise.race([
         fetch(proxyUrl, {
           signal: abortController.signal,
-          referrerPolicy: 'unsafe-url',
+          referrerPolicy: 'no-referrer',
         }),
         timeout(this.options.timeout),
       ])) as Response;
 
       if (!response || !response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
+        throw new Error(`HTTP error! status: ${response?.status ?? 0}`);
       }
 
       return response.json();
@@ -514,35 +613,53 @@ export class Downloader extends BaseDownloader {
     itemidx: number
   ): Promise<ReplyResponse> {
     const abortController = new AbortController();
-    this.abortControllers.set(commentID + ':' + contentID, abortController);
+    this.abortControllers.set(`${commentID}:${contentID}`, abortController);
 
     try {
+      this.assertCredentialProxy(proxy);
       // 使用设置的 credentials 来抓取留言
       const targetCredential = credentials.value.find(item => item.biz === fakeid && item.valid);
       if (!targetCredential) {
         throw new Error('目标公众号的 Credential 未设置');
       }
 
-      const Authorization = (preferences.value as Preferences).privateProxyAuthorization || '';
-      const url = `https://mp.weixin.qq.com/mp/appmsg_comment?action=getcommentreply&scene=0&appmsgid=${appmsgid}&idx=${itemidx}&__biz=${targetCredential.biz}&comment_id=${commentID}&uin=${targetCredential.uin}&key=${targetCredential.key}&pass_ticket=${encodeURIComponent(targetCredential.pass_ticket)}&appmsg_token=${encodeURIComponent(targetCredential.appmsg_token)}&wxtoken=777&devicetype=UnifiedPCMac&content_id=${contentID}&max_reply_id=${maxReplyID}&limit=100&x5=0&f=json`;
+      const url = buildCommentEndpoint('getcommentreply', {
+        scene: 0,
+        appmsgid,
+        idx: itemidx,
+        __biz: targetCredential.biz,
+        comment_id: commentID,
+        uin: targetCredential.uin,
+        key: targetCredential.key,
+        pass_ticket: targetCredential.pass_ticket,
+        appmsg_token: targetCredential.appmsg_token,
+        wxtoken: 777,
+        devicetype: 'UnifiedPCMac',
+        content_id: contentID,
+        max_reply_id: maxReplyID,
+        limit: 100,
+        x5: 0,
+        f: 'json',
+      });
       const headers: Record<string, string> = {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36 MicroMessenger/6.8.0(0x16080000) NetType/WIFI MiniProgramEnv/Mac MacWechat/WECHAT/WeChatBrowser XWEB/1191',
-        'Referer': 'https://mp.weixin.qq.com/',
+        'User-Agent':
+          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36 MicroMessenger/6.8.0(0x16080000) NetType/WIFI MiniProgramEnv/Mac MacWechat/WECHAT/WeChatBrowser XWEB/1191',
+        Referer: 'https://mp.weixin.qq.com/',
       };
       if (targetCredential.cookie) {
         headers.Cookie = targetCredential.cookie;
       }
-      const proxyUrl = `${proxy}?url=${encodeURIComponent(url)}&headers=${encodeURIComponent(JSON.stringify(headers))}&authorization=${Authorization}`;
+      const proxyUrl = this.buildProxyRequestUrl(proxy, url, headers);
       const response = (await Promise.race([
         fetch(proxyUrl, {
           signal: abortController.signal,
-          referrerPolicy: 'unsafe-url',
+          referrerPolicy: 'no-referrer',
         }),
         timeout(this.options.timeout),
       ])) as Response;
 
       if (!response || !response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
+        throw new Error(`HTTP error! status: ${response?.status ?? 0}`);
       }
 
       return response.json();
@@ -558,43 +675,21 @@ export class Downloader extends BaseDownloader {
     // 提取对象字符串
     const cgiData = await parseCgiDataNew(html);
     if (!cgiData) {
-      console.error('提取 window.cgiData 对象失败');
-      return;
+      throw new Error('提取 window.cgiDataNew 对象失败');
     }
 
-    let readNum = 0;
-    let oldLikeNum = 0;
-    let shareNum = 0;
-    let likeNum = 0;
-    let commentNum = 0;
-
-    try {
-      const barData = cgiData.user_info?.appmsg_bar_data
-        || cgiData.appmsg_bar_data
-        || cgiData.user_info;
-      if (barData) {
-        readNum = barData.read_num || 0; // 阅读量
-        oldLikeNum = barData.old_like_count || 0; // 点赞
-        shareNum = barData.share_count || 0; // 分享
-        likeNum = barData.like_count || 0; // 喜欢
-        commentNum = barData.comment_count || 0; // 留言
-      }
-    } catch (e) {
-      console.warn('解析元数据失败，使用默认值:', e);
+    const [article, existingMetadata] = await Promise.all([getArticleByLink(url), getMetadataCache(url)]);
+    if (!article) {
+      throw new Error(`文章(url: ${url} )未找到文章记录`);
     }
-
-    const article = await getArticleByLink(url);
+    const counts = mergeMetadataCounts(cgiData, existingMetadata);
 
     // 写入元数据表
     const metadata: Metadata = {
       fakeid: article.fakeid,
       url,
       title: article.title,
-      readNum,
-      oldLikeNum,
-      shareNum,
-      likeNum,
-      commentNum,
+      ...counts,
     };
     this.emit('download:metadata', url, metadata);
     await updateMetadataCache(metadata);

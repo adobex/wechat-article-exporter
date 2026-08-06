@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { formatDistance } from 'date-fns';
+import dayjs from 'dayjs';
 import { request } from '#shared/utils/request';
 import LoginModal from '~/components/modal/Login.vue';
 import StorageUsage from '~/components/StorageUsage.vue';
@@ -10,61 +10,31 @@ const loginAccount = useLoginAccount();
 const modal = useModal();
 
 const now = ref(new Date());
-const distance = computed(() => {
-  return (
-    loginAccount.value &&
-    formatDistance(new Date(loginAccount.value.expires), now.value, {
-      includeSeconds: true,
-      locale: {
-        formatDistance: function (token, count, options) {
-          if (now.value >= new Date(loginAccount.value.expires)) {
-            window.clearInterval(timer);
-            setTimeout(() => {
-              loginAccount.value = null;
-            }, 0);
-            return '已过期';
-          }
 
-          switch (token) {
-            case 'aboutXHours':
-              return '大约' + count + '个小时';
-            case 'aboutXMonths':
-              return '大约' + count + '个月';
-            case 'aboutXWeeks':
-              return '大约' + count + '周';
-            case 'aboutXYears':
-              return '大约' + count + '年';
-            case 'lessThanXMinutes':
-              return '小于' + count + '分钟';
-            case 'almostXYears':
-              return '接近' + count + '年';
-            case 'halfAMinute':
-              return '半分钟';
-            case 'lessThanXSeconds':
-              return '小于' + count + '秒';
-            case 'overXYears':
-              return '超过' + count + '年';
-            case 'xDays':
-              return count + '天';
-            case 'xHours':
-              return count + '个小时';
-            case 'xMinutes':
-              return count + '分钟';
-            case 'xMonths':
-              return count + '个月';
-            case 'xSeconds':
-              return count + '秒';
-            case 'xWeeks':
-              return count + '周';
-            case 'xYears':
-              return count + '年';
-            default:
-              return 'unknown';
-          }
-        },
-      },
-    })
-  );
+function formatRemainingTime(expires: Date, current: Date): string {
+  if (current >= expires) return '已过期';
+  const diffMs = expires.getTime() - current.getTime();
+  const seconds = Math.floor(diffMs / 1000);
+  if (seconds < 60) return `${seconds}秒`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}分钟`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}个小时`;
+  const days = Math.floor(hours / 24);
+  return `${days}天`;
+}
+
+const distance = computed(() => {
+  if (!loginAccount.value) return '';
+  const expires = new Date(loginAccount.value.expires);
+  const result = formatRemainingTime(expires, now.value);
+  if (result === '已过期') {
+    window.clearInterval(timer);
+    setTimeout(() => {
+      loginAccount.value = null;
+    }, 0);
+  }
+  return result;
 });
 const warning = computed(() => {
   const value = distance.value;

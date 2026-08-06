@@ -24,4 +24,3 @@ declare module 'html2pdf.js' {
   function html2pdf(): Html2PdfWorker;
   export default html2pdf;
 }
-

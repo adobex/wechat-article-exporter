@@ -12,6 +12,7 @@ export interface RequestOptions {
   cookie?: string;
   referer?: string;
   redirect?: RequestRedirect;
+  timeoutMs?: number;
 
   /**
    * start_login: 开始登录流程 (把微信原始响应中的 uuid 这个 set-cookie 传递给客户端，以便后续扫码登录用)

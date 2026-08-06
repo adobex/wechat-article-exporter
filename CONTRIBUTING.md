@@ -36,6 +36,8 @@ yarn
 yarn dev
 ```
 
+本地运行后使用 `http://localhost:3000/` 访问。不要改用 `127.0.0.1`，因为文章、HTML、资源等缓存保存在浏览器 IndexedDB 中，`localhost` 和 `127.0.0.1` 属于不同 origin，已有本地数据不会共享。
+
 
 ## 如何贡献
 
@@ -53,9 +55,9 @@ yarn dev
 3. 安装开发依赖并运行项目（参考 开发环境搭建）。
 4. 编写代码，确保：
     - **仅提交必要文件**。
-    - 遵循项目代码风格（使用 Prettier 工具）。
+    - 遵循项目代码风格（使用 Biome）。
     - 添加或更新测试用例。
-    - 通过所有测试：`yarn test`（或你的测试命令）。
+    - 通过完整检查：`yarn quality`，并确认 `yarn build` 成功。
 5. 提交时使用清晰的 Commit 消息。
 6. Push 到你的 Fork 并打开 Pull Request。
     - PR 标题和描述要清晰，引用相关 Issue（如 `fixes #123`）。
@@ -66,6 +68,6 @@ yarn dev
 - 同样通过 Pull Request 提交
 
 ### 4. 代码风格指南
-- 代码格式化采用 prettier
+- 代码格式化与 lint 采用 Biome
 - 变量命名采用 camelCase
-- import 顺序采用`yarn format`命令格式化
+- 提交前运行 `yarn format`，再运行 `yarn quality`

@@ -21,6 +21,12 @@ import GridLoading from '~/components/grid/Loading.vue';
 import GridNoRows from '~/components/grid/NoRows.vue';
 import PreviewArticle from '~/components/preview/Article.vue';
 import toastFactory from '~/composables/toast';
+import {
+  EXPORT_FORMAT_LABELS,
+  MD_IMAGE_MODE_LABELS,
+  WECHAT2MD_MODE_LABELS,
+  type Wechat2mdMetadataMap,
+} from '~/composables/useDownloadOptions';
 import { websiteName } from '~/config';
 import { sharedGridOptions } from '~/config/shared-grid-options';
 import { articleDeleted, updateArticleFakeid, updateArticleStatus } from '~/store/v2/article';
@@ -52,8 +58,22 @@ interface SingleArticleRow extends Partial<ArticleMetadata> {
   contentDownload: boolean;
   commentDownload: boolean;
   accountName?: string | null;
+  markdownExported?: boolean;
+  markdownPath?: string;
+  articleDir?: string;
   _status: string;
   is_deleted: boolean;
+}
+
+interface Wechat2mdManifestEntry {
+  title: string;
+  accountName: string;
+  publishDate: string;
+  url: string;
+  filepath: string;
+  articleDir: string;
+  relativePath: string;
+  mtimeMs: number;
 }
 
 const preferences = usePreferences();
@@ -129,20 +149,29 @@ const columnDefs = ref<ColDef[]>([
     cellClass: 'flex justify-center items-center font-mono',
   },
   {
-    headerName: '内容已下载',
+    headerName: 'Markdown已导出',
+    field: 'markdownExported',
+    cellDataType: 'boolean',
+    filter: 'agSetColumnFilter',
+    filterParams: createBooleanColumnFilterParams('已导出', '未导出'),
+    minWidth: 150,
+    cellClass: 'flex justify-center items-center',
+  },
+  {
+    headerName: '正文已缓存',
     field: 'contentDownload',
     cellDataType: 'boolean',
     filter: 'agSetColumnFilter',
-    filterParams: createBooleanColumnFilterParams('已下载', '未下载'),
+    filterParams: createBooleanColumnFilterParams('已缓存', '未缓存'),
     minWidth: 140,
     cellClass: 'flex justify-center items-center',
   },
   {
     field: 'commentDownload',
-    headerName: '留言已下载',
+    headerName: '留言已同步',
     cellDataType: 'boolean',
     filter: 'agSetColumnFilter',
-    filterParams: createBooleanColumnFilterParams('已下载', '未下载'),
+    filterParams: createBooleanColumnFilterParams('已同步', '未同步'),
     minWidth: 150,
     cellClass: 'flex justify-center items-center',
   },
@@ -185,6 +214,15 @@ const columnDefs = ref<ColDef[]>([
     filter: 'agNumberColumnFilter',
     minWidth: 100,
     cellClass: 'flex justify-center items-center font-mono',
+  },
+  {
+    headerName: 'Markdown路径',
+    field: 'markdownPath',
+    cellDataType: 'text',
+    filter: 'agTextColumnFilter',
+    minWidth: 260,
+    initialHide: true,
+    cellClass: 'font-mono',
   },
   {
     headerName: '操作',
@@ -268,9 +306,21 @@ function parseUrlParams(url: string) {
   const parsed = new URL(url);
   const params = parsed.searchParams;
   const fakeid = params.get('__biz') || 'SINGLE_ARTICLE_FAKEID';
-  const mid = params.get('mid') || params.get('appmsgid') || `${Date.now()}`;
+  const mid = params.get('mid') || params.get('appmsgid') || String(stableNumber(url));
   const idx = params.get('idx') || params.get('itemidx') || '1';
   return { fakeid, mid: Number(mid), idx: Number(idx) || 1 };
+}
+
+function stableNumber(value: string) {
+  let hash = 0;
+  for (let i = 0; i < value.length; i++) {
+    hash = (hash * 31 + value.charCodeAt(i)) >>> 0;
+  }
+  return hash || Date.now();
+}
+
+function stableId(value: string) {
+  return stableNumber(value).toString(36);
 }
 
 function createRow(url: string): SingleArticleRow {
@@ -296,9 +346,37 @@ function createRow(url: string): SingleArticleRow {
     contentDownload: false,
     commentDownload: false,
     accountName: null,
+    markdownExported: false,
+    markdownPath: '',
+    articleDir: '',
     _status: '',
     is_deleted: false,
   };
+}
+
+function createRecoveredRow(entry: Wechat2mdManifestEntry): SingleArticleRow {
+  const normalized = normalizeUrl(entry.url);
+  const row = createRow(normalized);
+  const publishTime = parsePublishTime(entry.publishDate, entry.mtimeMs);
+
+  row.id = `wechat2md:${stableId(normalized)}`;
+  row.title = entry.title || row.title;
+  row.author_name = entry.accountName || '--';
+  row.accountName = entry.accountName || null;
+  row.create_time = publishTime;
+  row.update_time = publishTime;
+  row.markdownExported = true;
+  row.markdownPath = entry.filepath;
+  row.articleDir = entry.articleDir;
+  row._status = '已导出Markdown';
+
+  return row;
+}
+
+function parsePublishTime(publishDate: string, mtimeMs: number) {
+  const parsed = publishDate ? dayjs(publishDate) : null;
+  if (parsed?.isValid()) return parsed.unix();
+  return Math.floor(mtimeMs / 1000);
 }
 
 async function addArticle() {
@@ -313,7 +391,28 @@ async function addArticle() {
     await upsertArticleStub(row);
     refreshGrid();
     inputUrl.value = '';
-    await downloadRows([row], { silent: true });
+
+    // 通过服务端获取文章元数据（标题、作者等）
+    try {
+      const meta = await $fetch<{
+        success: boolean;
+        title?: string;
+        author?: string;
+        accountName?: string;
+        publishDate?: string;
+        cover?: string;
+        digest?: string;
+      }>('/api/local/article-meta', { params: { url: normalized } });
+      if (meta.success) {
+        if (meta.title) row.title = meta.title;
+        if (meta.author) row.author_name = meta.author;
+        if (meta.accountName) row.accountName = meta.accountName;
+        if (meta.digest) row.digest = meta.digest;
+        if (meta.cover) row.cover = meta.cover;
+        await upsertArticleStub(row);
+        updateRow(row);
+      }
+    } catch {}
   } catch (error: any) {
     toast.error('添加失败', error?.message || '链接格式不正确');
   }
@@ -340,6 +439,7 @@ function buildVirtualArticle(row: SingleArticleRow): AppMsgExWithFakeID {
     has_red_packet_cover: 0,
     is_deleted: false,
     is_pay_subscribe: 0,
+    wecoin_count: 0,
     item_show_type: 0,
     itemidx: row.itemidx,
     link: row.link,
@@ -357,6 +457,70 @@ function buildVirtualArticle(row: SingleArticleRow): AppMsgExWithFakeID {
 
 function upsertArticleStub(row: SingleArticleRow) {
   return db.article.put(buildVirtualArticle(row), `${row.fakeid}:${row.aid}`);
+}
+
+const recoverWechat2mdLoading = ref(false);
+async function recoverWechat2mdRecords() {
+  recoverWechat2mdLoading.value = true;
+
+  try {
+    const data = await $fetch<{
+      success: boolean;
+      error?: string;
+      outputDir: string;
+      total: number;
+      skipped: number;
+      records: Wechat2mdManifestEntry[];
+    }>('/api/local/wechat2md-manifest');
+
+    if (!data.success) {
+      toast.error('恢复失败', data.error || '扫描本地导出目录失败');
+      return;
+    }
+
+    let added = 0;
+    let updated = 0;
+    const rowsByLink = new Map(globalRowData.value.map(row => [row.link, row]));
+
+    for (const entry of data.records) {
+      let recovered: SingleArticleRow;
+      try {
+        recovered = createRecoveredRow(entry);
+      } catch {
+        continue;
+      }
+
+      const existing = rowsByLink.get(recovered.link);
+      if (existing) {
+        existing.title = existing.title === '未命名文章' ? recovered.title : existing.title;
+        existing.author_name = existing.author_name === '--' ? recovered.author_name : existing.author_name;
+        existing.accountName = existing.accountName || recovered.accountName;
+        existing.update_time = existing.update_time || recovered.update_time;
+        existing.markdownExported = true;
+        existing.markdownPath = recovered.markdownPath;
+        existing.articleDir = recovered.articleDir;
+        existing._status = existing._status || '已导出Markdown';
+        await upsertArticleStub(existing);
+        updated++;
+      } else {
+        globalRowData.value.push(recovered);
+        rowsByLink.set(recovered.link, recovered);
+        await upsertArticleStub(recovered);
+        added++;
+      }
+    }
+
+    globalRowData.value = [...globalRowData.value].sort((a, b) => b.update_time - a.update_time);
+    refreshGrid();
+    toast.success(
+      '恢复完成',
+      `新增 ${added} 篇，更新 ${updated} 篇；扫描 ${data.total} 个本地导出文件${data.skipped ? `，跳过 ${data.skipped} 个无 URL 文件` : ''}`
+    );
+  } catch (error: any) {
+    toast.error('恢复失败', error?.message || '无法读取本地导出记录');
+  } finally {
+    recoverWechat2mdLoading.value = false;
+  }
 }
 
 function getSelectedRows(): SingleArticleRow[] {
@@ -377,6 +541,23 @@ function onSelectionChanged(event: SelectionChangedEvent) {
 }
 const selectedArticleUrls = computed(() => {
   return selectedArticles.value.map(article => article.link);
+});
+const selectedWechat2mdMetadata = computed<Wechat2mdMetadataMap>(() => {
+  return Object.fromEntries(
+    selectedArticles.value.map(article => {
+      const accountName = article.accountName?.trim();
+      return [
+        article.link,
+        {
+          title: article.title,
+          accountName: accountName && accountName !== '未知公众号' ? accountName : undefined,
+          publishDate: article.update_time ? formatTimeStamp(article.update_time) : undefined,
+          markdownExported: article.markdownExported,
+          contentCached: article.contentDownload,
+        },
+      ];
+    })
+  );
 });
 const contentNotDownloadedCount = computed(() => {
   return selectedArticles.value.filter(article => !article.contentDownload).length;
@@ -445,7 +626,7 @@ const {
       article.commentNum = metadata.commentNum;
 
       if ((preferences.value as unknown as Preferences).downloadConfig.metadataOverrideContent) {
-        // 如果同步下载文章内容，则更新相关字段
+        // 如果同步阅读量时覆盖正文缓存，则更新相关字段
         article.contentDownload = true;
         article._status = '正常';
         updateArticleStatus(url, '正常');
@@ -541,20 +722,145 @@ async function updateRowFromHtml(row: SingleArticleRow) {
 
 function previewRow(row: SingleArticleRow) {
   if (!row.contentDownload) {
-    toast.warning('提示', '请先抓取该文章内容');
+    toast.warning('提示', '请先缓存该文章正文');
     return;
   }
   const article = buildVirtualArticle(row) as AppMsgExWithFakeID;
   previewArticleRef.value?.open(article);
 }
 
+// ===== 搜狗微信搜索 =====
+interface SogouResult {
+  title: string;
+  url: string;
+  account: string;
+  abstract: string;
+  cover: string;
+  time: string;
+}
+const searchKeyword = ref('');
+const searchResults = ref<SogouResult[]>([]);
+const searchLoading = ref(false);
+const showSearchModal = ref(false);
+
+async function sogouSearch() {
+  if (!searchKeyword.value.trim()) {
+    toast.warning('提示', '请输入搜索关键词');
+    return;
+  }
+  searchLoading.value = true;
+  searchResults.value = [];
+  showSearchModal.value = true;
+  try {
+    const data = await $fetch<{ results: SogouResult[] }>('/api/local/sogou-search', {
+      params: { query: searchKeyword.value.trim() },
+    });
+    searchResults.value = data.results || [];
+    if (searchResults.value.length === 0) {
+      toast.info('提示', '未找到相关文章');
+    }
+  } catch (e: any) {
+    toast.error('搜索失败', e?.message || '请稍后重试');
+  } finally {
+    searchLoading.value = false;
+  }
+}
+
+function addFromSearch(result: SogouResult) {
+  const url = result.url;
+  if (globalRowData.value.some(row => row.link === url)) {
+    toast.info('提示', '该文章已在列表中');
+    return;
+  }
+  const row = createRow(url);
+  row.title = result.title || row.title;
+  row.author_name = result.account || row.author_name;
+  row.digest = result.abstract || row.digest;
+  globalRowData.value = [row, ...globalRowData.value];
+  upsertArticleStub(row);
+  refreshGrid();
+  toast.success('已添加', result.title);
+}
+
+function addAllSearchResults() {
+  let added = 0;
+  for (const result of searchResults.value) {
+    if (!globalRowData.value.some(row => row.link === result.url)) {
+      const row = createRow(result.url);
+      row.title = result.title || row.title;
+      row.author_name = result.account || row.author_name;
+      row.digest = result.abstract || row.digest;
+      globalRowData.value = [row, ...globalRowData.value];
+      upsertArticleStub(row);
+      added++;
+    }
+  }
+  refreshGrid();
+  if (added > 0) {
+    toast.success('批量添加', `已添加 ${added} 篇文章`);
+  } else {
+    toast.info('提示', '所有文章已在列表中');
+  }
+}
+
+// ===== 下载选项（共享） =====
 const {
-  loading: exportBtnLoading,
-  phase: exportPhase,
-  completed_count: exportCompletedCount,
-  total_count: exportTotalCount,
-  exportFile,
-} = useExporter();
+  wechat2mdMode,
+  mdImageMode,
+  exportFormat,
+  wechat2mdLoading,
+  exportBtnLoading,
+  exportPhase,
+  exportCompletedCount,
+  exportTotalCount,
+  runDownload,
+} = useDownloadOptions();
+
+const exportActionLabel = computed(() => {
+  return exportFormat.value === 'markdown' ? '导出未导出' : '导出文件';
+});
+
+function getMarkdownTargetArticles(forceMarkdown: boolean) {
+  if (exportFormat.value !== 'markdown') return [];
+  return selectedArticles.value.filter(article => forceMarkdown || !article.markdownExported);
+}
+
+async function ensureMarkdownContentCached(forceMarkdown: boolean) {
+  const missing = getMarkdownTargetArticles(forceMarkdown).filter(article => !article.contentDownload);
+  if (missing.length === 0) return;
+
+  await downloadRows(missing, { silent: true });
+}
+
+async function runSelectedDownload(forceMarkdown: boolean | Event = false) {
+  const shouldForceMarkdown = forceMarkdown === true;
+  if (exportFormat.value === 'markdown') {
+    await ensureMarkdownContentCached(shouldForceMarkdown);
+  }
+  const result = (await runDownload(
+    selectedArticleUrls.value,
+    contentNotDownloadedCount.value,
+    selectedWechat2mdMetadata.value,
+    {
+      forceMarkdown: shouldForceMarkdown,
+      requireCacheForMarkdown: true,
+    }
+  )) as { successUrls?: string[] } | undefined;
+  if (exportFormat.value === 'markdown' && result?.successUrls?.length) {
+    const successUrlSet = new Set(result.successUrls);
+    await Promise.all(
+      selectedArticles.value
+        .filter(article => successUrlSet.has(article.link))
+        .map(async article => {
+          article.markdownExported = true;
+          article._status = '已导出Markdown';
+          updateRow(article);
+          await upsertArticleStub(article);
+        })
+    );
+  }
+  return result;
+}
 
 async function deleteRowData(row: SingleArticleRow) {
   const key = `${row.fakeid}:${row.aid}`;
@@ -590,18 +896,26 @@ async function removeRows() {
 
     <div class="flex flex-col h-full divide-y divide-gray-200">
       <!-- 顶部操作区 -->
-      <header class="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between px-3 py-3">
-        <div class="flex flex-1 gap-3">
-          <UInput v-model="inputUrl" placeholder="请输入公众号文章链接" class="flex-1" @keyup.enter="addArticle" />
-          <UButton color="blue" @click="addArticle">添加</UButton>
+      <header class="flex flex-col gap-3 px-3 py-3">
+        <!-- 第一行：链接输入 + 搜狗搜索 -->
+        <div class="flex flex-col gap-3 lg:flex-row lg:items-center">
+          <div class="flex flex-1 gap-3">
+            <UInput v-model="inputUrl" placeholder="请输入公众号文章链接" class="flex-1" @keyup.enter="addArticle" />
+            <UButton color="blue" @click="addArticle">添加</UButton>
+          </div>
+          <div class="flex flex-1 gap-3">
+            <UInput v-model="searchKeyword" placeholder="搜狗微信搜索关键词" class="flex-1" @keyup.enter="sogouSearch" />
+            <UButton color="indigo" :loading="searchLoading" @click="sogouSearch">搜索</UButton>
+          </div>
         </div>
-        <div class="flex items-center gap-3">
+        <!-- 第二行：操作按钮 -->
+        <div class="flex items-center gap-3 flex-wrap">
           <ButtonGroup
             :items="[
               { label: '修复fakeid', event: 'fix-fakeid' },
-              { label: '文章内容', event: 'download-article-html' },
-              { label: '阅读量 (需要Credential)', event: 'download-article-metadata' },
-              { label: '留言内容 (需要Credential)', event: 'download-article-comment' },
+              { label: '缓存正文', event: 'download-article-html' },
+              { label: '同步阅读量 (需要Credential)', event: 'download-article-metadata' },
+              { label: '同步留言 (需要Credential)', event: 'download-article-comment' },
             ]"
             @fix-fakeid="download('fakeid', selectedArticleUrls)"
             @download-article-html="download('html', selectedArticleUrls)"
@@ -613,41 +927,104 @@ async function removeRows() {
               :disabled="selectedArticleUrls.length === 0"
               color="white"
               class="font-mono"
-              :label="downloadBtnLoading ? `抓取中 ${downloadCompletedCount}/${downloadTotalCount}` : '抓取'"
+              :label="downloadBtnLoading ? `缓存中 ${downloadCompletedCount}/${downloadTotalCount}` : '缓存正文'"
               trailing-icon="i-heroicons-chevron-down-20-solid"
             />
           </ButtonGroup>
 
           <ButtonGroup
             :items="[
-              { label: 'Excel', event: 'export-article-excel' },
-              { label: 'JSON', event: 'export-article-json' },
-              { label: 'HTML', event: 'export-article-html' },
-              { label: 'Txt', event: 'export-article-text' },
-              { label: 'Markdown', event: 'export-article-markdown' },
-              { label: 'Word (内测中)', event: 'export-article-word' },
-              { label: 'PDF (内测中)', event: 'export-article-pdf' },
+              { label: '轻量版 (fetch)', event: 'select-lite' },
+              { label: 'Playwright 版', event: 'select-playwright' },
             ]"
-            @export-article-excel="exportFile('excel', selectedArticleUrls)"
-            @export-article-json="exportFile('json', selectedArticleUrls)"
-            @export-article-html="exportFile('html', selectedArticleUrls, contentNotDownloadedCount)"
-            @export-article-text="exportFile('text', selectedArticleUrls, contentNotDownloadedCount)"
-            @export-article-markdown="exportFile('markdown', selectedArticleUrls, contentNotDownloadedCount)"
-            @export-article-word="exportFile('word', selectedArticleUrls, contentNotDownloadedCount)"
-            @export-article-pdf="exportFile('pdf', selectedArticleUrls, contentNotDownloadedCount)"
+            @select-lite="wechat2mdMode = 'lite'"
+            @select-playwright="wechat2mdMode = 'playwright'"
           >
             <UButton
-              :loading="exportBtnLoading"
-              :disabled="selectedArticleUrls.length === 0"
-              color="white"
-              class="font-mono"
-              :label="exportBtnLoading ? `${exportPhase} ${exportCompletedCount}/${exportTotalCount}` : '导出'"
+              color="teal"
+              variant="soft"
+              :label="WECHAT2MD_MODE_LABELS[wechat2mdMode]"
               trailing-icon="i-heroicons-chevron-down-20-solid"
             />
           </ButtonGroup>
 
+          <ButtonGroup
+            :items="[
+              { label: 'Excel', event: 'fmt-excel' },
+              { label: 'JSON', event: 'fmt-json' },
+              { label: 'HTML', event: 'fmt-html' },
+              { label: 'Txt', event: 'fmt-text' },
+              { label: 'Markdown', event: 'fmt-markdown' },
+              { label: 'Word (内测中)', event: 'fmt-word' },
+              { label: 'PDF (内测中)', event: 'fmt-pdf' },
+            ]"
+            @fmt-excel="exportFormat = 'excel'"
+            @fmt-json="exportFormat = 'json'"
+            @fmt-html="exportFormat = 'html'"
+            @fmt-text="exportFormat = 'text'"
+            @fmt-markdown="exportFormat = 'markdown'"
+            @fmt-word="exportFormat = 'word'"
+            @fmt-pdf="exportFormat = 'pdf'"
+          >
+            <UButton
+              :loading="exportBtnLoading"
+              color="white"
+              class="font-mono"
+              :label="exportBtnLoading ? `${exportPhase} ${exportCompletedCount}/${exportTotalCount}` : EXPORT_FORMAT_LABELS[exportFormat]"
+              trailing-icon="i-heroicons-chevron-down-20-solid"
+            />
+          </ButtonGroup>
+
+          <ButtonGroup
+            v-if="exportFormat === 'markdown'"
+            :items="[
+              { label: '图片下载到本地', event: 'img-indexed' },
+              { label: '图片 Base64 内嵌', event: 'img-base64' },
+              { label: '保留 CDN 链接', event: 'img-cdn' },
+            ]"
+            @img-indexed="mdImageMode = 'indexed'"
+            @img-base64="mdImageMode = 'base64'"
+            @img-cdn="mdImageMode = 'cdn'"
+          >
+            <UButton
+              color="white"
+              variant="soft"
+              :label="MD_IMAGE_MODE_LABELS[mdImageMode]"
+              trailing-icon="i-heroicons-chevron-down-20-solid"
+            />
+          </ButtonGroup>
+
+          <UButton
+            color="primary"
+            :loading="wechat2mdLoading || exportBtnLoading"
+            :disabled="selectedArticleUrls.length === 0"
+            @click="runSelectedDownload()"
+          >
+            {{ wechat2mdLoading ? 'wechat2md...' : exportBtnLoading ? '导出中...' : exportActionLabel }}
+          </UButton>
+
+          <UButton
+            v-if="exportFormat === 'markdown'"
+            color="amber"
+            variant="soft"
+            icon="i-lucide:refresh-cw"
+            :loading="wechat2mdLoading"
+            :disabled="selectedArticleUrls.length === 0 || exportBtnLoading"
+            label="覆盖导出"
+            @click="runSelectedDownload(true)"
+          />
+
           <UButton color="rose" variant="soft" :disabled="selectedArticleUrls.length === 0" @click="removeRows">
             移除
+          </UButton>
+          <UButton
+            color="emerald"
+            variant="soft"
+            icon="i-lucide:folder-sync"
+            :loading="recoverWechat2mdLoading"
+            @click="recoverWechat2mdRecords"
+          >
+            恢复本地导出
           </UButton>
         </div>
       </header>
@@ -664,5 +1041,53 @@ async function removeRows() {
     </div>
 
     <PreviewArticle ref="previewArticleRef" />
+
+    <!-- 搜狗搜索结果弹窗 -->
+    <UModal v-model="showSearchModal" :ui="{ width: 'sm:max-w-3xl' }">
+      <UCard>
+        <template #header>
+          <div class="flex items-center justify-between">
+            <h3 class="text-lg font-semibold">搜索结果：{{ searchKeyword }}</h3>
+            <div class="flex gap-2">
+              <UButton v-if="searchResults.length > 0" size="sm" color="blue" variant="soft" @click="addAllSearchResults">
+                全部添加
+              </UButton>
+              <UButton size="sm" color="gray" variant="ghost" icon="i-heroicons-x-mark" @click="showSearchModal = false" />
+            </div>
+          </div>
+        </template>
+        <div v-if="searchLoading" class="flex justify-center py-8">
+          <UIcon name="i-heroicons-arrow-path" class="w-6 h-6 animate-spin text-gray-400" />
+        </div>
+        <div v-else-if="searchResults.length === 0" class="py-8 text-center text-gray-400">
+          未找到相关文章
+        </div>
+        <div v-else class="divide-y divide-gray-100 dark:divide-gray-800 max-h-[60vh] overflow-y-auto">
+          <div
+            v-for="(item, idx) in searchResults"
+            :key="idx"
+            class="flex gap-3 py-3 px-1 hover:bg-gray-50 dark:hover:bg-gray-800 rounded"
+          >
+            <img
+              v-if="item.cover"
+              :src="item.cover"
+              class="w-20 h-14 object-cover rounded flex-shrink-0"
+              referrerpolicy="no-referrer"
+            />
+            <div class="flex-1 min-w-0">
+              <div class="font-medium text-sm truncate">{{ item.title }}</div>
+              <p class="text-xs text-gray-500 mt-1 line-clamp-2">{{ item.abstract }}</p>
+              <div class="flex items-center gap-3 mt-1 text-xs text-gray-400">
+                <span v-if="item.account">{{ item.account }}</span>
+                <span v-if="item.time">{{ item.time }}</span>
+              </div>
+            </div>
+            <UButton size="xs" color="blue" variant="soft" class="flex-shrink-0 self-center" @click="addFromSearch(item)">
+              添加
+            </UButton>
+          </div>
+        </div>
+      </UCard>
+    </UModal>
   </div>
 </template>

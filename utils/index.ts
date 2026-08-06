@@ -1,6 +1,7 @@
 import JSZip from 'jszip';
 import mime from 'mime';
 import { formatTimeStamp, sleep } from '#shared/utils/helpers';
+import { extractWechatScriptAssignment, type SafeScriptValue } from '#shared/utils/html';
 import { request } from '#shared/utils/request';
 import { getComment } from '~/apis';
 import { getAssetCache, updateAssetCache } from '~/store/v2/assets';
@@ -8,6 +9,48 @@ import type { DownloadableArticle } from '~/types/types';
 import type { AudioResource, VideoPageInfo } from '~/types/video';
 import * as pool from '~/utils/pool';
 import { extractCommentId } from './comment';
+
+type ScriptRecord = Record<string, SafeScriptValue>;
+
+function isLoopbackPage(): boolean {
+  const hostname = window.location.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  return ['localhost', '127.0.0.1', '::1'].includes(hostname) && ['http:', 'https:'].includes(window.location.protocol);
+}
+
+function extractAssignmentFromScripts(sources: string[], marker: string): SafeScriptValue | null {
+  for (const source of sources) {
+    const value = extractWechatScriptAssignment(source, marker);
+    if (value !== null) return value;
+  }
+  return null;
+}
+
+function asScriptRecord(value: SafeScriptValue | null): ScriptRecord | null {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : null;
+}
+
+function asScriptRecords(value: SafeScriptValue | null): ScriptRecord[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is ScriptRecord => !!item && typeof item === 'object' && !Array.isArray(item));
+}
+
+function parseScriptStringLiteral(raw: string | undefined): string | null {
+  if (!raw) return null;
+  const value = extractWechatScriptAssignment(`window.__value = ${raw}`, 'window.__value');
+  return typeof value === 'string' ? value : null;
+}
+
+function isVideoPageInfo(value: ScriptRecord): boolean {
+  return (
+    typeof value.video_id === 'string' &&
+    typeof value.is_mp_video === 'number' &&
+    typeof value.cover_url === 'string' &&
+    Array.isArray(value.mp_video_trans_info) &&
+    value.mp_video_trans_info.every(
+      item => !!item && typeof item === 'object' && !Array.isArray(item) && typeof item.url === 'string'
+    )
+  );
+}
 
 /**
  * 使用代理下载资源
@@ -23,20 +66,32 @@ async function downloadAssetWithProxy<T extends Blob | string>(
   timeout = 30
 ) {
   const headers: Record<string, string> = {};
+  let requestProxy = proxy;
   if (withCredential) {
+    if (!isLoopbackPage()) {
+      throw new Error('凭据请求仅允许在 localhost 本地工具中执行');
+    }
     try {
-      const credentials = JSON.parse(window.localStorage.getItem('credentials')!);
+      const rawCredentials = window.localStorage.getItem('credentials');
+      if (!rawCredentials) throw new Error('credentials missing');
+      const credentials = JSON.parse(rawCredentials);
+      if (typeof credentials.pass_ticket !== 'string' || typeof credentials.wap_sid2 !== 'string') {
+        throw new Error('credentials invalid');
+      }
       headers.cookie = `pass_ticket=${credentials.pass_ticket};wap_sid2=${credentials.wap_sid2}`;
-    } catch (e) {}
+    } catch {
+      throw new Error('未找到有效的微信凭据');
+    }
+    requestProxy = '/api/local/proxy';
   }
-  let targetURL = proxy
-    ? `${proxy}?url=${encodeURIComponent(url)}&headers=${encodeURIComponent(JSON.stringify(headers))}`
+  let targetURL = requestProxy
+    ? `${requestProxy}?url=${encodeURIComponent(url)}&headers=${encodeURIComponent(JSON.stringify(headers))}`
     : url;
   targetURL = targetURL.replace(/^http:\/\//, 'https://');
 
   return await request<T>(targetURL, {
     timeout: timeout * 1000,
-    referrerPolicy: 'unsafe-url',
+    referrerPolicy: 'no-referrer',
   });
 }
 
@@ -133,6 +188,7 @@ export async function packHTMLAssets(fakeid: string, html: string, title: string
 
   const parser = new DOMParser();
   const document = parser.parseFromString(html, 'text/html');
+  const scriptSources = Array.from(document.scripts, script => script.textContent || '');
   const $jsArticleContent = document.querySelector('#js_article')!;
   const $jsArticleBottomBar = document.querySelector('#js_article_bottom_bar')!;
 
@@ -176,23 +232,17 @@ export async function packHTMLAssets(fakeid: string, html: string, title: string
   }
 
   // 渲染ip属地
-  function getIpWoridng(ipConfig: any) {
-    let ipWording = '';
-    if (parseInt(ipConfig.countryId, 10) === 156) {
-      ipWording = ipConfig.provinceName;
-    } else if (ipConfig.countryId) {
-      ipWording = ipConfig.countryName;
+  function getIpWording(ipConfig: ScriptRecord) {
+    if (Number(ipConfig.countryId) === 156 && typeof ipConfig.provinceName === 'string') {
+      return ipConfig.provinceName;
     }
-    return ipWording;
+    return ipConfig.countryId && typeof ipConfig.countryName === 'string' ? ipConfig.countryName : '';
   }
   const ipWrp = document.getElementById('js_ip_wording_wrp')!;
   const ipWording = document.getElementById('js_ip_wording')!;
-  const ipWordingMatchResult = html.match(/window\.ip_wording = (?<data>{\s+countryName: '[^']+',[^}]+})/s);
-  if (ipWrp && ipWording && ipWordingMatchResult && ipWordingMatchResult.groups && ipWordingMatchResult.groups.data) {
-    const json = ipWordingMatchResult.groups.data;
-    // eslint-disable-next-line no-eval
-    eval('window.ip_wording = ' + json);
-    const ipWordingDisplay = getIpWoridng((window as any).ip_wording);
+  const ipConfig = asScriptRecord(extractAssignmentFromScripts(scriptSources, 'window.ip_wording'));
+  if (ipWrp && ipWording && ipConfig) {
+    const ipWordingDisplay = getIpWording(ipConfig);
     if (ipWordingDisplay !== '') {
       ipWording.innerHTML = ipWordingDisplay;
       ipWrp.style.display = 'inline-block';
@@ -223,12 +273,8 @@ export async function packHTMLAssets(fakeid: string, html: string, title: string
     bodyCls += ' page_share_text';
 
     // 顶部作者栏
-    const qmtplTextMatchResult = html.match(/(?<code>window\.__QMTPL_SSR_DATA__\s*=\s*\{.+?};)/s);
-    if (qmtplTextMatchResult && qmtplTextMatchResult.groups && qmtplTextMatchResult.groups.code) {
-      const code = qmtplTextMatchResult.groups.code;
-      // eslint-disable-next-line no-eval
-      eval(code);
-      const data = (window as any).__QMTPL_SSR_DATA__;
+    const data = asScriptRecord(extractAssignmentFromScripts(scriptSources, 'window.__QMTPL_SSR_DATA__'));
+    if (data) {
       if (data && typeof data.title === 'string' && !$js_text_desc.innerHTML.trim()) {
         let text = data.title as string;
         text = text.replace(/\r/g, '').replace(/\n/g, '<br>');
@@ -247,20 +293,11 @@ export async function packHTMLAssets(fakeid: string, html: string, title: string
       );
 
       let desc: string | null = null;
-      const assignFromMatch = (match: RegExpMatchArray | null, key: string) => {
-        if (match && match.groups && match.groups.value) {
-          const code = `window.${key} = ${match.groups.value}`;
-          // eslint-disable-next-line no-eval
-          eval(code);
-          // @ts-ignore
-          return (window as any)[key] as string;
-        }
-        return null;
-      };
+      const assignFromMatch = (match: RegExpMatchArray | null) => parseScriptStringLiteral(match?.groups?.value);
 
-      desc = assignFromMatch(textContentMatch, '__WX_TEXT_NO_ENCODE__');
+      desc = assignFromMatch(textContentMatch);
       if (!desc) {
-        desc = assignFromMatch(contentMatch, '__WX_CONTENT_NO_ENCODE__');
+        desc = assignFromMatch(contentMatch);
       }
 
       if (desc) {
@@ -440,30 +477,31 @@ export async function packHTMLAssets(fakeid: string, html: string, title: string
       return str;
     }
 
-    const qmtplMatchResult = html.match(/(?<code>window\.__QMTPL_SSR_DATA__\s*=\s*\{.+?)<\/script>/s);
-    if (qmtplMatchResult && qmtplMatchResult.groups && qmtplMatchResult.groups.code) {
-      const code = qmtplMatchResult.groups.code;
-      eval(code);
-      const data = (window as any).__QMTPL_SSR_DATA__;
+    const data = asScriptRecord(extractAssignmentFromScripts(scriptSources, 'window.__QMTPL_SSR_DATA__'));
+    if (data && typeof data.desc === 'string') {
       let desc = data.desc.replace(/\r/g, '').replace(/\n/g, '<br>').replace(/\s/g, '&nbsp;');
       desc = decode_html(desc, false);
       $js_image_desc.innerHTML = desc;
 
       $jsArticleContent.querySelector('#js_top_profile')!.classList.remove('profile_area_hide');
     }
-    const pictureMatchResult = html.match(/(?<code>window\.picture_page_info_list\s*=.+\.slice\(0,\s*20\);)/s);
-    if (pictureMatchResult && pictureMatchResult.groups && pictureMatchResult.groups.code) {
-      const code = pictureMatchResult.groups.code;
-      eval(code);
-      const picture_page_info_list = (window as any).picture_page_info_list;
+    const pictures = asScriptRecords(
+      extractAssignmentFromScripts(scriptSources, 'window.picture_page_info_list')
+    ).slice(0, 20);
+    if (pictures.length > 0) {
       const containerEl = $jsArticleContent.querySelector('#js_share_content_page_hd')!;
-      let innerHTML =
-        '<div style="display: flex;flex-direction: column;align-items: center;gap: 10px;padding-block: 20px;">';
-      for (const picture of picture_page_info_list) {
-        innerHTML += `<img src="${picture.cdn_url}" alt="" style="display: block;border: 1px solid gray;border-radius: 5px;max-width: 90%;" onclick="window.open(this.src, '_blank', 'popup')" />`;
+      const pictureList = document.createElement('div');
+      pictureList.style.cssText =
+        'display: flex;flex-direction: column;align-items: center;gap: 10px;padding-block: 20px;';
+      for (const picture of pictures) {
+        if (typeof picture.cdn_url !== 'string') continue;
+        const image = document.createElement('img');
+        image.src = picture.cdn_url;
+        image.alt = '';
+        image.style.cssText = 'display: block;border: 1px solid gray;border-radius: 5px;max-width: 90%;';
+        pictureList.appendChild(image);
       }
-      innerHTML += '</div>';
-      containerEl.innerHTML = innerHTML;
+      containerEl.replaceChildren(pictureList);
     }
   }
 
@@ -474,12 +512,11 @@ export async function packHTMLAssets(fakeid: string, html: string, title: string
     bodyCls +=
       'zh_CN wx_wap_page wx_wap_desktop_fontsize_2 page_share_video white_video_page discuss_tab appmsg_skin_default appmsg_style_default pages_skin_pc';
     const videoContentMatchResult = html.match(
-      /(?<code>var\s+videoContentNoEncode\s*=\s*window\.a_value_which_never_exists\s*\|\|\s*(?<value>'[^']+'))/s
+      /var\s+videoContentNoEncode\s*=\s*window\.a_value_which_never_exists\s*\|\|\s*(?<value>'[^']+')/s
     );
-    if (videoContentMatchResult && videoContentMatchResult.groups && videoContentMatchResult.groups.value) {
-      const code = 'window.videoContentNoEncode = ' + videoContentMatchResult.groups.value;
-      eval(code);
-      let desc = (window as any).videoContentNoEncode;
+    const videoDescription = parseScriptStringLiteral(videoContentMatchResult?.groups?.value);
+    if (videoDescription) {
+      let desc = videoDescription;
       desc = desc.replace(/\r/g, '').replace(/\n/g, '<br>');
       $js_common_share_desc.innerHTML = desc;
     }
@@ -489,52 +526,50 @@ export async function packHTMLAssets(fakeid: string, html: string, title: string
     // 分享视频
     // poster
     let poster = '';
-    const mpVideoCoverUrlMatchResult = html.match(/(?<code>window\.__mpVideoCoverUrl\s*=\s*'[^']*';)/s);
-    if (mpVideoCoverUrlMatchResult && mpVideoCoverUrlMatchResult.groups && mpVideoCoverUrlMatchResult.groups.code) {
-      const code = mpVideoCoverUrlMatchResult.groups.code;
-      eval(code);
-      poster = (window as any).__mpVideoCoverUrl;
-    }
+    const coverValue = extractAssignmentFromScripts(scriptSources, 'window.__mpVideoCoverUrl');
+    if (typeof coverValue === 'string') poster = coverValue;
 
     // video info
     let videoUrl = '';
-    const mpVideoTransInfoMatchResult = html.match(/(?<code>window\.__mpVideoTransInfo\s*=\s*\[.+?];)/s);
-    if (mpVideoTransInfoMatchResult && mpVideoTransInfoMatchResult.groups && mpVideoTransInfoMatchResult.groups.code) {
-      const code = mpVideoTransInfoMatchResult.groups.code;
-      eval(code);
-      const mpVideoTransInfo = (window as any).__mpVideoTransInfo;
-      if (Array.isArray(mpVideoTransInfo) && mpVideoTransInfo.length > 0) {
-        mpVideoTransInfo.forEach((trans: any) => {
-          trans.url = trans.url.replace(/&amp;/g, '&');
-        });
+    const mpVideoTransInfo = asScriptRecords(
+      extractAssignmentFromScripts(scriptSources, 'window.__mpVideoTransInfo')
+    ).filter(trans => typeof trans.url === 'string');
+    if (mpVideoTransInfo.length > 0) {
+      mpVideoTransInfo.forEach(trans => {
+        trans.url = (trans.url as string).replace(/&amp;/g, '&');
+      });
 
-        // 这里为了节省流量需要控制清晰度
-        videoUrl = mpVideoTransInfo[mpVideoTransInfo.length - 1].url;
+      // 这里为了节省流量需要控制清晰度
+      videoUrl = mpVideoTransInfo[mpVideoTransInfo.length - 1].url as string;
 
-        // 下载资源
-        const videoURLMap = new Map<string, string>();
-        const resourceDownloadFn = async (url: string, proxy: string) => {
-          const videoData = await downloadAssetWithProxy<Blob>(url, proxy, false, 10);
-          const uuid = new Date().getTime() + Math.random().toString();
-          const ext = mime.getExtension(videoData.type);
-          zip.file(`assets/${uuid}.${ext}`, videoData);
+      // 下载资源
+      const videoURLMap = new Map<string, string>();
+      const resourceDownloadFn = async (url: string, proxy: string) => {
+        const videoData = await downloadAssetWithProxy<Blob>(url, proxy, false, 10);
+        const uuid = Date.now() + Math.random().toString();
+        const ext = mime.getExtension(videoData.type);
+        zip.file(`assets/${uuid}.${ext}`, videoData);
 
-          videoURLMap.set(url, `./assets/${uuid}.${ext}`);
-          return videoData.size;
-        };
+        videoURLMap.set(url, `./assets/${uuid}.${ext}`);
+        return videoData.size;
+      };
 
-        const urls: string[] = [];
-        if (poster) {
-          urls.push(poster);
-        }
-        urls.push(videoUrl);
-        await pool.downloads<string>(urls, resourceDownloadFn);
-
-        const div = document.createElement('div');
-        div.style.cssText = 'height: 381px;background: #000;border-radius: 4px; overflow: hidden;margin-bottom: 12px;';
-        div.innerHTML = `<video src="${videoURLMap.get(videoUrl)}" poster="${videoURLMap.get(poster)}" controls style="width: 100%;height: 100%;"></video>`;
-        $js_mpvedio.appendChild(div);
+      const urls: string[] = [];
+      if (poster) {
+        urls.push(poster);
       }
+      urls.push(videoUrl);
+      await pool.downloads<string>(urls, resourceDownloadFn);
+
+      const div = document.createElement('div');
+      div.style.cssText = 'height: 381px;background: #000;border-radius: 4px; overflow: hidden;margin-bottom: 12px;';
+      const video = document.createElement('video');
+      video.src = videoURLMap.get(videoUrl) || '';
+      video.poster = videoURLMap.get(poster) || '';
+      video.controls = true;
+      video.style.cssText = 'width: 100%;height: 100%;';
+      div.appendChild(video);
+      $js_mpvedio.appendChild(div);
     }
   }
 
@@ -589,13 +624,10 @@ export async function packHTMLAssets(fakeid: string, html: string, title: string
   }
 
   // 下载内嵌视频
-  const videoPageInfosMatchResult = html.match(
-    /(?<code>var videoPageInfos = \[.+?window.__videoPageInfos = videoPageInfos;)/s
-  );
-  if (videoPageInfosMatchResult && videoPageInfosMatchResult.groups && videoPageInfosMatchResult.groups.code) {
-    const code = videoPageInfosMatchResult.groups.code;
-    eval(code);
-    const videoPageInfos: VideoPageInfo[] = (window as any).__videoPageInfos;
+  const videoPageInfos = asScriptRecords(extractAssignmentFromScripts(scriptSources, 'videoPageInfos')).filter(
+    isVideoPageInfo
+  ) as unknown as VideoPageInfo[];
+  if (videoPageInfos.length > 0) {
     videoPageInfos.forEach(videoPageInfo => {
       videoPageInfo.mp_video_trans_info.forEach(trans => {
         trans.url = trans.url.replace(/&amp;/g, '&');

@@ -1,7 +1,13 @@
 import dayjs from 'dayjs';
 import mime from 'mime';
+import {
+  type ExistingArticleOutput,
+  normalizeArticleUrl,
+  planArticleOutputPaths,
+  readArticleUrlFromMarkdown,
+} from '#shared/utils/article-output-path';
 import { filterInvalidFilenameChars, sleep } from '#shared/utils/helpers';
-import { parseCgiDataNew } from '#shared/utils/html';
+import { extractWechatScriptAssignment, parseCgiDataNew, type SafeScriptValue } from '#shared/utils/html';
 import { createTurndownService } from '#shared/utils/markdown';
 import { renderHTMLFromCgiDataNew, renderTextFromCgiDataNew } from '#shared/utils/renderer';
 import usePreferences from '~/composables/usePreferences';
@@ -22,6 +28,56 @@ type ExportType = 'excel' | 'json' | 'html' | 'txt' | 'markdown' | 'word' | 'pdf
 
 const preferences: Ref<Preferences> = usePreferences() as unknown as Ref<Preferences>;
 
+export interface FileExportQueueResult {
+  successUrls: string[];
+  failedUrls: string[];
+}
+
+interface MarkdownExportContext {
+  url: string;
+  article: Awaited<ReturnType<typeof getArticleByLink>>;
+  contentElement: Element;
+  title: string;
+  accountName: string;
+  publishDate: string;
+}
+
+function asSafeScriptRecord(value: SafeScriptValue | null): Record<string, SafeScriptValue> | null {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : null;
+}
+
+function parseSafeScriptString(expression: string | undefined): string | null {
+  if (!expression) return null;
+  const value = extractWechatScriptAssignment(
+    `window.__exporter_value__ = ${expression};`,
+    'window.__exporter_value__'
+  );
+  return typeof value === 'string' ? value : null;
+}
+
+function extractTopLevelPictureUrls(source: string): string[] {
+  const candidates = Array.from(
+    source.matchAll(/^(?<indent>\s*)cdn_url\s*:\s*(?<value>(?:JsDecode\([^\n]+\)|['"][^\n]*['"])),?\s*$/gm)
+  );
+  if (candidates.length === 0) return [];
+
+  const minimumIndent = Math.min(...candidates.map(match => match.groups?.indent.length ?? Number.MAX_SAFE_INTEGER));
+  return candidates
+    .filter(match => match.groups?.indent.length === minimumIndent)
+    .map(match => parseSafeScriptString(match.groups?.value))
+    .filter((value): value is string => Boolean(value));
+}
+
+export class FileExportError extends Error {
+  constructor(
+    message: string,
+    public readonly result: FileExportQueueResult
+  ) {
+    super(message);
+    this.name = 'FileExportError';
+  }
+}
+
 export class Exporter extends BaseDownloader {
   private exportType: ExportType = 'html';
   private allAccountInfo: MpAccount[] = [];
@@ -30,13 +86,19 @@ export class Exporter extends BaseDownloader {
   private exportRootDirectoryHandle: FileSystemDirectoryHandle | null = null;
   private readonly resources: Set<{ url: string; fakeid: string }>;
 
+  // 服务端固定输出目录（设置后跳过目录选择器，通过 API 写文件）
+  public serverOutputDir: string | null = null;
+
+  // Markdown 图片模式：indexed=本地文件 | base64=内嵌 | cdn=保留原链接
+  public mdImageMode: 'indexed' | 'base64' | 'cdn' = 'indexed';
+
   constructor(urls: string[], options: DownloadOptions = {}) {
     super(urls, options);
     this.resources = new Set();
   }
 
   // 启动导出任务
-  public async startExport(type: ExportType = 'html') {
+  public async startExport(type: ExportType = 'html'): Promise<FileExportQueueResult | undefined> {
     if (this.isRunning) {
       throw new Error('导出任务正在运行中，无需重复启动');
     }
@@ -57,6 +119,7 @@ export class Exporter extends BaseDownloader {
     this.emit('export:begin');
 
     this.allAccountInfo = await getAllInfo();
+    let result: FileExportQueueResult | undefined;
 
     try {
       if (this.exportType === 'excel') {
@@ -72,23 +135,18 @@ export class Exporter extends BaseDownloader {
         await this.processExportQueue();
 
         // 3. 替换html中的资源路径，并写入文件系统
-        await this.exportHtmlFiles();
+        result = await this.exportHtmlFiles();
       } else if (this.exportType === 'txt') {
-        await this.exportTxtFiles();
+        result = await this.exportTxtFiles();
       } else if (this.exportType === 'word') {
-        await this.exportWordFiles();
+        result = await this.exportWordFiles();
       } else if (this.exportType === 'markdown') {
-        await this.exportMarkdownFiles();
+        result = await this.exportMarkdownFiles();
       } else if (this.exportType === 'pdf') {
-        // 1. 提取出所有html中需要下载的资源链接（复用HTML导出管线）
         await this.extractResources();
         this.emit('export:download', this.resources.size);
-
-        // 2. 采用队列下载 resources 资源
         await this.processExportQueue();
-
-        // 3. 将资源以 data URL 嵌入，生成 PDF 文件
-        await this.exportPdfFiles();
+        result = await this.exportPdfFiles();
       }
     } finally {
       this.isRunning = false;
@@ -96,6 +154,8 @@ export class Exporter extends BaseDownloader {
       this.emit('export:finish', elapse);
       this.cancelAllPending();
     }
+
+    return result;
   }
 
   // 提取出 html 中的子资源，并保存在 resource-map 表中
@@ -198,22 +258,32 @@ export class Exporter extends BaseDownloader {
     urls: string[],
     task: (url: string) => Promise<void>,
     options: { concurrency?: number; progressEvent?: string } = {}
-  ): Promise<void> {
+  ): Promise<FileExportQueueResult> {
     const { concurrency = 5, progressEvent = 'export:progress' } = options;
     const activePromises: Set<Promise<void>> = new Set();
     const queue = [...urls];
     let completedCount = 0;
+    let failureCount = 0;
+    let firstError: unknown = null;
+    const result: FileExportQueueResult = {
+      successUrls: [],
+      failedUrls: [],
+    };
 
     while (queue.length > 0 || activePromises.size > 0) {
       while (activePromises.size < concurrency && queue.length > 0) {
         const url = queue.pop()!;
         const promise = task(url)
           .then(() => {
+            result.successUrls.push(url);
             completedCount++;
             this.emit(progressEvent, completedCount);
           })
           .catch(e => {
             console.error(`导出文件失败(url: ${url}):`, e);
+            failureCount++;
+            result.failedUrls.push(url);
+            firstError ??= e;
             completedCount++;
             this.emit(progressEvent, completedCount);
           });
@@ -227,6 +297,13 @@ export class Exporter extends BaseDownloader {
         await Promise.race(activePromises);
       }
     }
+
+    if (failureCount > 0) {
+      const message = firstError instanceof Error ? firstError.message : String(firstError || '未知错误');
+      throw new FileExportError(`导出失败 ${failureCount} 篇：${message}`, result);
+    }
+
+    return result;
   }
 
   // 下载资源任务
@@ -256,7 +333,7 @@ export class Exporter extends BaseDownloader {
         this.proxyManager.recordSuccess(proxy);
         return;
       } catch (error) {
-        await this.handleDownloadFailure(proxy, url, attempt, error);
+        await this.handleDownloadFailure(this.proxyManager, proxy, url, attempt, error);
       }
     }
 
@@ -336,12 +413,12 @@ export class Exporter extends BaseDownloader {
   }
 
   // 导出 html 文件（并发处理）
-  private async exportHtmlFiles() {
+  private async exportHtmlFiles(): Promise<FileExportQueueResult> {
     const total = this.urls.length;
     console.log(`总共${total}篇文章`);
     this.emit('export:write', total);
 
-    await this.processFileExportQueue(
+    const result = await this.processFileExportQueue(
       this.urls,
       async url => {
         const cached = await getHtmlCache(url);
@@ -383,14 +460,15 @@ export class Exporter extends BaseDownloader {
       { progressEvent: 'export:write:progress' }
     );
     await sleep(100);
+    return result;
   }
 
   // 导出 txt 文件（并发处理）
-  private async exportTxtFiles() {
+  private async exportTxtFiles(): Promise<FileExportQueueResult> {
     const total = this.urls.length;
     this.emit('export:total', total);
 
-    await this.processFileExportQueue(this.urls, async url => {
+    const result = await this.processFileExportQueue(this.urls, async url => {
       const filename = await this.exportDirName(url);
       console.log(`开始导出: ${filename}(${url})`);
 
@@ -401,35 +479,246 @@ export class Exporter extends BaseDownloader {
       await this.writeFile(filename + '.txt', blob);
     });
     await sleep(100);
+    return result;
   }
 
-  // 导出 markdown 文件（并发处理）
-  private async exportMarkdownFiles() {
-    const total = this.urls.length;
-    this.emit('export:total', total);
+  // 导出 markdown 文件（并发处理，图片下载到本地 images/ 目录并用相对路径引用）
+  private async exportMarkdownFiles(): Promise<FileExportQueueResult> {
+    const uniqueUrls = Array.from(new Map(this.urls.map(url => [normalizeArticleUrl(url), url] as const)).values());
+    this.emit('export:total', uniqueUrls.length);
 
     const turndownService = createTurndownService();
 
-    await this.processFileExportQueue(this.urls, async url => {
-      const filename = await this.exportDirName(url);
-      console.log(`开始导出: ${filename}(${url})`);
+    const parser = new DOMParser();
+    const prepared = new Map<string, MarkdownExportContext | Error>();
+    const contexts: MarkdownExportContext[] = [];
+    for (const url of uniqueUrls) {
+      try {
+        const context = await this.prepareMarkdownExport(url, parser);
+        prepared.set(url, context);
+        contexts.push(context);
+      } catch (error) {
+        prepared.set(url, error instanceof Error ? error : new Error(String(error)));
+      }
+    }
 
-      const content = await this.getRenderedHTML(url);
-      if (!content) return;
-      const markdown = turndownService.turndown(content).trim();
+    const planningOptions = await this.getMarkdownOutputPlanningOptions();
+    const plans = await planArticleOutputPaths(
+      contexts.map(context => ({
+        url: context.url,
+        accountName: context.accountName,
+        title: context.title,
+        publishDate: context.publishDate,
+      })),
+      planningOptions
+    );
+    const directoryByUrl = new Map(
+      plans.map((plan, index) => [normalizeArticleUrl(contexts[index].url), plan.relativeDirectory] as const)
+    );
 
-      const blob = new Blob([markdown], { type: 'text/markdown' });
-      await this.writeFile(filename + '.md', blob);
+    const result = await this.processFileExportQueue(uniqueUrls, async url => {
+      const context = prepared.get(url);
+      if (!context) {
+        throw new Error(`文章(url: ${url}) 的 Markdown 预检结果缺失`);
+      }
+      if (context instanceof Error) {
+        throw context;
+      }
+
+      const dirname = directoryByUrl.get(normalizeArticleUrl(url));
+      if (!dirname) {
+        throw new Error(`文章(url: ${url}) 未分配唯一输出路径`);
+      }
+      console.log(`开始导出 Markdown: ${dirname}(${url})`);
+
+      const imgs = context.contentElement.querySelectorAll<HTMLImageElement>('img');
+      let imgIdx = 0;
+      for (const img of imgs) {
+        const src = img.getAttribute('data-src') || img.getAttribute('src');
+        if (!src) continue;
+        const imageUrl = src.startsWith('http') ? src : `https:${src}`;
+
+        if (this.mdImageMode === 'cdn') {
+          img.setAttribute('src', imageUrl);
+          img.setAttribute('alt', img.getAttribute('data-alt') || img.getAttribute('alt') || '');
+          continue;
+        }
+
+        try {
+          const proxy = this.proxyManager.getBestProxy();
+          const blob = await this.download(context.article.fakeid || '', imageUrl, proxy);
+          this.proxyManager.recordSuccess(proxy);
+
+          if (this.mdImageMode === 'base64') {
+            const arrayBuffer = await blob.arrayBuffer();
+            const base64 = btoa(new Uint8Array(arrayBuffer).reduce((d, b) => d + String.fromCharCode(b), ''));
+            const dataUri = `data:${blob.type || 'image/png'};base64,${base64}`;
+            img.setAttribute('src', dataUri);
+          } else {
+            const ext = mime.getExtension(blob.type) || 'png';
+            const imageFilename = `${String(imgIdx + 1).padStart(3, '0')}.${ext}`;
+            await this.writeFile(`${dirname}/images/${imageFilename}`, blob);
+            img.setAttribute('src', `images/${imageFilename}`);
+            imgIdx++;
+          }
+          img.setAttribute('alt', img.getAttribute('data-alt') || img.getAttribute('alt') || '');
+        } catch (e) {
+          img.setAttribute('alt', `${img.getAttribute('alt') || '图片'}（下载失败）`);
+        }
+      }
+
+      const markdownBody = turndownService.turndown(context.contentElement.innerHTML).trim();
+      const header = `---\ntitle: ${JSON.stringify(context.title)}\nauthor: ${JSON.stringify(context.accountName)}\ndate: ${JSON.stringify(context.publishDate)}\nurl: ${JSON.stringify(url)}\n---\n\n# ${context.title}\n\n`;
+      const fileContent = `${header}${markdownBody}\n`;
+
+      const blob = new Blob([fileContent], { type: 'text/markdown' });
+      await this.writeFile(`${dirname}/index.md`, blob);
     });
     await sleep(100);
+    return result;
+  }
+
+  private async prepareMarkdownExport(url: string, parser: DOMParser): Promise<MarkdownExportContext> {
+    const cached = await getHtmlCache(url);
+    if (!cached) {
+      throw new Error(`文章(url: ${url} )的 html 还未缓存，不能导出 Markdown`);
+    }
+
+    const article = await getArticleByLink(url);
+    const doc = parser.parseFromString(await cached.file.text(), 'text/html');
+    let contentElement = this.findMarkdownContentElement(doc);
+    let metadataDoc = doc;
+    if (!contentElement || !this.hasMarkdownContent(contentElement)) {
+      const renderedHTML = await this.getRenderedHTML(url, false);
+      if (renderedHTML) {
+        const renderedDoc = parser.parseFromString(renderedHTML, 'text/html');
+        const renderedContentElement = this.findMarkdownContentElement(renderedDoc, true);
+        if (renderedContentElement && this.hasMarkdownContent(renderedContentElement)) {
+          contentElement = renderedContentElement;
+          metadataDoc = renderedDoc;
+        }
+      }
+    }
+
+    if (!contentElement || !this.hasMarkdownContent(contentElement)) {
+      throw new Error(`文章(url: ${url} )未找到正文内容，不能导出 Markdown`);
+    }
+    contentElement.querySelectorAll('script, style, link, noscript, iframe').forEach(element => {
+      element.remove();
+    });
+
+    const account = this.allAccountInfo.find(item => item.fakeid === article.fakeid);
+    const title =
+      doc.querySelector('.rich_media_title, #activity-name, h1')?.textContent?.replace(/\s+/g, ' ').trim() ||
+      metadataDoc
+        .querySelector('.rich_media_title, #activity-name, h1, title')
+        ?.textContent?.replace(/\s+/g, ' ')
+        .trim() ||
+      article.title ||
+      cached.title ||
+      '未命名文章';
+    const accountName =
+      doc.querySelector('.profile_nickname, #js_name, .nick_name')?.textContent?.replace(/\s+/g, ' ').trim() ||
+      metadataDoc.querySelector('.profile_nickname, #js_name, .nick_name')?.textContent?.replace(/\s+/g, ' ').trim() ||
+      account?.nickname ||
+      article.fakeid ||
+      '未知公众号';
+    const publishDate =
+      (article.update_time ? dayjs.unix(article.update_time).format('YYYY-MM-DD HH:mm:ss') : '') ||
+      doc.querySelector('#publish_time, .publish_time')?.textContent?.trim() ||
+      metadataDoc.querySelector('.create_time')?.textContent?.trim() ||
+      '';
+
+    return { url, article, contentElement, title, accountName, publishDate };
+  }
+
+  private async getMarkdownOutputPlanningOptions(): Promise<{
+    existing?: ExistingArticleOutput[];
+    readExisting?: (relativeDirectory: string) => Promise<{ url?: string | null } | undefined>;
+  }> {
+    if (this.serverOutputDir) {
+      const manifest = await $fetch<{
+        success: boolean;
+        error?: string;
+        records?: Array<{ relativePath: string; url: string }>;
+      }>('/api/local/wechat2md-manifest', {
+        query: { outputDir: this.serverOutputDir },
+      });
+      if (!manifest.success) {
+        if (/ENOENT|no such file/i.test(manifest.error || '')) return { existing: [] };
+        throw new Error(manifest.error || '无法预检 Markdown 输出目录');
+      }
+      return {
+        existing: (manifest.records || []).map(record => ({
+          relativeDirectory: record.relativePath.replace(/\\/g, '/').replace(/\/index\.md$/, ''),
+          url: record.url,
+        })),
+      };
+    }
+
+    return {
+      readExisting: relativeDirectory => this.readBrowserMarkdownOutput(relativeDirectory),
+    };
+  }
+
+  private async readBrowserMarkdownOutput(relativeDirectory: string): Promise<{ url?: string | null } | undefined> {
+    let directory = this.exportRootDirectoryHandle!;
+    for (const segment of relativeDirectory.split('/')) {
+      try {
+        directory = await directory.getDirectoryHandle(segment);
+      } catch (error) {
+        if ((error as DOMException)?.name === 'NotFoundError') return undefined;
+        throw error;
+      }
+    }
+
+    try {
+      const fileHandle = await directory.getFileHandle('index.md');
+      const file = await fileHandle.getFile();
+      return { url: readArticleUrlFromMarkdown(await file.text()) || null };
+    } catch (error) {
+      if ((error as DOMException)?.name === 'NotFoundError') return { url: null };
+      throw error;
+    }
+  }
+
+  private findMarkdownContentElement(doc: Document, includeBroadContainers = false): Element | null {
+    const selectors = [
+      '#js_content',
+      '.rich_media_content',
+      '#img-content',
+      '#js_text_desc',
+      '#js_image_desc',
+      '#js_common_share_desc',
+      '.item_show_type_0',
+      '.item_show_type_8',
+      '.item_show_type_10',
+      '.pay_subscribe_notice',
+    ];
+    if (includeBroadContainers) {
+      selectors.push('.__page_content__', '#js_article');
+    }
+
+    for (const selector of selectors) {
+      const element = doc.querySelector(selector);
+      if (element && this.hasMarkdownContent(element)) {
+        return element;
+      }
+    }
+    return null;
+  }
+
+  private hasMarkdownContent(element: Element): boolean {
+    const text = element.textContent?.replace(/\s+/g, '').trim() || '';
+    return text.length > 0 || element.querySelector('img') !== null;
   }
 
   // 导出 word 文件（并发处理）
-  private async exportWordFiles() {
+  private async exportWordFiles(): Promise<FileExportQueueResult> {
     const total = this.urls.length;
     this.emit('export:total', total);
 
-    await this.processFileExportQueue(this.urls, async url => {
+    const result = await this.processFileExportQueue(this.urls, async url => {
       const filename = await this.exportDirName(url);
       console.log(`开始导出: ${filename}(${url})`);
 
@@ -440,74 +729,61 @@ export class Exporter extends BaseDownloader {
       await this.writeFile(filename + '.docx', blob);
     });
     await sleep(100);
+    return result;
   }
 
-  /**
-   * 导出 PDF：调用服务端 Puppeteer API 静默生成
-   * 复用 normalizeHtml 保留原始微信排版，资源以 data URL 内嵌，
-   * 逐篇文章 POST HTML 到服务端，接收 PDF Blob 后写入文件系统。
-   */
-  private async exportPdfFiles() {
-    const total = this.urls.length;
-    this.emit('export:write', total);
+  /** Generate PDFs through the server-side Puppeteer endpoint. */
+  private async exportPdfFiles(): Promise<FileExportQueueResult> {
+    this.emit('export:write', this.urls.length);
 
-    await this.processFileExportQueue(
+    const result = await this.processFileExportQueue(
       this.urls,
-      async (url) => {
+      async url => {
         const cached = await getHtmlCache(url);
         if (!cached) {
-          console.warn(`文章(url: ${url} )的 html 还未下载，不能导出`);
-          return;
+          throw new Error(`文章(url: ${url}) 的 HTML 尚未缓存`);
         }
 
         const filename = await this.exportDirName(url);
-        console.log(`开始导出 PDF: ${cached.title}，文件名: ${filename}`);
-
         const html = await cached.file.text();
         const resourceMap = await getResourceMapCache(url);
         const urlmap = new Map<string, string>();
         if (resourceMap) {
           for (const resourceUrl of resourceMap.resources) {
             const resource = await getResourceCache(resourceUrl);
-            if (resource) {
-              urlmap.set(resourceUrl, await this.blobToDataUrl(resource.file));
-            }
+            if (resource) urlmap.set(resourceUrl, await this.blobToDataUrl(resource.file));
           }
         }
 
         let finalHtml = await this.normalizeHtml(cached, html, urlmap);
-
-        const doc = new DOMParser().parseFromString(finalHtml, 'text/html');
-        const jsContentText = doc.querySelector('#js_content')?.textContent?.replace(/[\s\u00A0]+/g, '') || '';
-        if (!jsContentText) {
-          const renderedHTML = await this.getRenderedHTML(url, true);
-          if (renderedHTML) {
-            finalHtml = renderedHTML;
-          }
+        const document = new DOMParser().parseFromString(finalHtml, 'text/html');
+        const contentText = document.querySelector('#js_content')?.textContent?.replace(/[\s\u00A0]+/g, '') || '';
+        if (!contentText) {
+          const renderedHtml = await this.getRenderedHTML(url, true);
+          if (renderedHtml) finalHtml = renderedHtml;
         }
 
-        const pdfStyleTag = `<style>
+        const pdfStyle = `<style>
   html, body { background: white !important; background-color: white !important; }
   p { margin-block: 0.3em !important; }
 </style>`;
-        finalHtml = finalHtml.replace('</head>', `${pdfStyleTag}\n</head>`);
+        finalHtml = finalHtml.replace('</head>', `${pdfStyle}\n</head>`);
 
         const response = await fetch('/api/web/pdf/generate', {
           method: 'POST',
           headers: { 'Content-Type': 'text/html; charset=utf-8' },
           body: finalHtml,
         });
-
         if (!response.ok) {
           throw new Error(`PDF 生成失败: ${response.status} ${response.statusText}`);
         }
 
-        const pdfBlob = await response.blob();
-        await this.writeFile(filename + '.pdf', pdfBlob);
+        await this.writeFile(`${filename}.pdf`, await response.blob());
       },
-      { concurrency: 2, progressEvent: 'export:write:progress' },
+      { concurrency: 2, progressEvent: 'export:write:progress' }
     );
     await sleep(100);
+    return result;
   }
 
   private blobToDataUrl(blob: Blob): Promise<string> {
@@ -575,7 +851,7 @@ export class Exporter extends BaseDownloader {
       (_, p1, url, p3) => {
         if (urlmap.has(url)) {
           const path = urlmap.get(url)!;
-          return `${p1}${path}${p3}`;
+          return `${p1}./${path}${p3}`;
         } else {
           console.warn('背景图片丢失: ', url);
           return `${p1}${url}${p3}`;
@@ -588,13 +864,7 @@ export class Exporter extends BaseDownloader {
     const $jsArticleContent = document.querySelector('#js_article')!;
 
     // #js_content 默认是不可见的(通过js修改为可见)，需要移除该样式
-    const $jsContent = $jsArticleContent.querySelector('#js_content');
-    $jsContent?.removeAttribute('style');
-
-    const contentText = $jsContent?.textContent?.replace(/[\s\u00A0]+/g, '') || '';
-    if ($jsContent && !contentText && cachedHtml.title) {
-      $jsContent.innerHTML = `<p style="font-size:17px;line-height:1.6;white-space:pre-wrap;">${cachedHtml.title.replace(/\n/g, '<br />')}</p>`;
-    }
+    $jsArticleContent.querySelector('#js_content')?.removeAttribute('style');
 
     // 删除无用dom元素
     $jsArticleContent.querySelector('#js_top_ad_area')?.remove();
@@ -644,12 +914,9 @@ export class Exporter extends BaseDownloader {
     }
     const ipWrp = document.getElementById('js_ip_wording_wrp')!;
     const ipWording = document.getElementById('js_ip_wording')!;
-    const ipWordingMatchResult = html.match(/window\.ip_wording = (?<data>{\s+countryName: '[^']+',[^}]+})/s);
-    if (ipWrp && ipWording && ipWordingMatchResult && ipWordingMatchResult.groups && ipWordingMatchResult.groups.data) {
-      const json = ipWordingMatchResult.groups.data;
-      // eslint-disable-next-line no-eval
-      eval('window.ip_wording = ' + json);
-      const ipWordingDisplay = getIpWoridng((window as any).ip_wording);
+    const ipConfig = asSafeScriptRecord(extractWechatScriptAssignment(html, 'window.ip_wording'));
+    if (ipWrp && ipWording && ipConfig) {
+      const ipWordingDisplay = getIpWoridng(ipConfig);
       if (ipWordingDisplay !== '') {
         ipWording.innerHTML = ipWordingDisplay;
         ipWrp.style.display = 'inline-block';
@@ -740,14 +1007,10 @@ export class Exporter extends BaseDownloader {
       bodyCls += ' page_share_text';
 
       // 顶部作者栏
-      const qmtplTextMatchResult = html.match(/(?<code>window\.__QMTPL_SSR_DATA__\s*=\s*\{.+?};)/s);
-      if (qmtplTextMatchResult && qmtplTextMatchResult.groups && qmtplTextMatchResult.groups.code) {
-        const code = qmtplTextMatchResult.groups.code;
-        // eslint-disable-next-line no-eval
-        eval(code);
-        const data = (window as any).__QMTPL_SSR_DATA__;
-        if (data && typeof data.title === 'string' && !$js_text_desc.innerHTML.trim()) {
-          let text = data.title as string;
+      const textPageData = asSafeScriptRecord(extractWechatScriptAssignment(html, 'window.__QMTPL_SSR_DATA__'));
+      if (textPageData) {
+        if (typeof textPageData.title === 'string' && !$js_text_desc.innerHTML.trim()) {
+          let text = textPageData.title;
           text = text.replace(/\r/g, '').replace(/\n/g, '<br>');
           $js_text_desc.innerHTML = text;
         }
@@ -763,21 +1026,9 @@ export class Exporter extends BaseDownloader {
           /var\s+ContentNoEncode\s*=\s*window\.a_value_which_never_exists\s*\|\|\s*(?<value>'[^']*')/s
         );
 
-        let desc: string | null = null;
-        const assignFromMatch = (match: RegExpMatchArray | null, key: string) => {
-          if (match && match.groups && match.groups.value) {
-            const code = `window.${key} = ${match.groups.value}`;
-            // eslint-disable-next-line no-eval
-            eval(code);
-            // @ts-ignore
-            return (window as any)[key] as string;
-          }
-          return null;
-        };
-
-        desc = assignFromMatch(textContentMatch, '__WX_TEXT_NO_ENCODE__');
+        let desc = parseSafeScriptString(textContentMatch?.groups?.value);
         if (!desc) {
-          desc = assignFromMatch(contentMatch, '__WX_CONTENT_NO_ENCODE__');
+          desc = parseSafeScriptString(contentMatch?.groups?.value);
         }
 
         if (desc) {
@@ -834,27 +1085,30 @@ export class Exporter extends BaseDownloader {
         return str;
       }
 
-      const qmtplMatchResult = html.match(/(?<code>window\.__QMTPL_SSR_DATA__\s*=\s*\{.+?)<\/script>/s);
-      if (qmtplMatchResult && qmtplMatchResult.groups && qmtplMatchResult.groups.code) {
-        const code = qmtplMatchResult.groups.code;
-        eval(code);
-        const data = (window as any).__QMTPL_SSR_DATA__;
-        let desc = data.desc.replace(/\r/g, '').replace(/\n/g, '<br>').replace(/\s/g, '&nbsp;');
+      const imagePageData = asSafeScriptRecord(extractWechatScriptAssignment(html, 'window.__QMTPL_SSR_DATA__'));
+      if (imagePageData && typeof imagePageData.desc === 'string') {
+        let desc = imagePageData.desc.replace(/\r/g, '').replace(/\n/g, '<br>').replace(/\s/g, '&nbsp;');
         desc = decode_html(desc, false);
         $js_image_desc.innerHTML = desc;
 
-        $jsArticleContent.querySelector('#js_top_profile')!.classList.remove('profile_area_hide');
+        $jsArticleContent.querySelector('#js_top_profile')?.classList.remove('profile_area_hide');
       }
       const pictureMatchResult = html.match(/(?<code>window\.picture_page_info_list\s*=.+\.slice\(0,\s*20\);)/s);
       if (pictureMatchResult && pictureMatchResult.groups && pictureMatchResult.groups.code) {
         const code = pictureMatchResult.groups.code;
-        eval(code);
-        const picture_page_info_list = (window as any).picture_page_info_list;
+        const withoutSlice = code.replace(/\.slice\(0,\s*20\);\s*$/, ';');
+        const pictureValue = extractWechatScriptAssignment(withoutSlice, 'window.picture_page_info_list');
+        const pictureUrls = Array.isArray(pictureValue)
+          ? pictureValue
+              .slice(0, 20)
+              .map(item => asSafeScriptRecord(item)?.cdn_url)
+              .filter((value): value is string => typeof value === 'string')
+          : extractTopLevelPictureUrls(code).slice(0, 20);
         const containerEl = $jsArticleContent.querySelector('#js_share_content_page_hd')!;
         let innerHTML =
           '<div style="display: flex;flex-direction: column;align-items: center;gap: 10px;padding-block: 20px;">';
-        for (const picture of picture_page_info_list) {
-          innerHTML += `<img src="${picture.cdn_url}" alt="" style="display: block;border: 1px solid gray;border-radius: 5px;max-width: 90%;" onclick="window.open(this.src, '_blank', 'popup')" />`;
+        for (const pictureUrl of pictureUrls) {
+          innerHTML += `<img src="${pictureUrl}" alt="" style="display: block;border: 1px solid gray;border-radius: 5px;max-width: 90%;" />`;
         }
         innerHTML += '</div>';
         containerEl.innerHTML = innerHTML;
@@ -923,6 +1177,7 @@ ${commentHTML}
 
   // 获取文件存储目录
   private async acquireExportDirectoryHandle(): Promise<void> {
+    if (this.serverOutputDir) return;
     if (!this.exportRootDirectoryHandle) {
       // @ts-ignore
       this.exportRootDirectoryHandle = await window.showDirectoryPicker({
@@ -934,6 +1189,20 @@ ${commentHTML}
 
   // 写入文件
   public async writeFile(path: string, file: Blob): Promise<void> {
+    if (this.serverOutputDir) {
+      const fullPath = `${this.serverOutputDir}/${path}`;
+      const arrayBuffer = await file.arrayBuffer();
+      const base64 = btoa(new Uint8Array(arrayBuffer).reduce((data, byte) => data + String.fromCharCode(byte), ''));
+      const result = await $fetch<{ success: boolean; error?: string }>('/api/local/write-file', {
+        method: 'POST',
+        body: { path: fullPath, base64 },
+      });
+      if (!result.success) {
+        throw new Error(result.error || `写入文件失败: ${fullPath}`);
+      }
+      return;
+    }
+
     const segment = path.split('/');
     const filename = segment[segment.length - 1];
     let directory = this.exportRootDirectoryHandle!;
@@ -949,8 +1218,14 @@ ${commentHTML}
     const fileHandle = await directory.getFileHandle(filename, { create: true });
     // @ts-ignore
     const writable = await fileHandle.createWritable();
-    await writable.write(file);
-    await writable.close();
+    try {
+      // File System Access stages writes and commits the replacement only when close succeeds.
+      await writable.write(file);
+      await writable.close();
+    } catch (error) {
+      await writable.abort().catch(() => {});
+      throw error;
+    }
   }
 
   // 确定导出文件的目录名
@@ -961,9 +1236,8 @@ ${commentHTML}
     const article = await getArticleByLink(articleUrl);
     const articleUpdateTime = dayjs.unix(article.update_time);
     const account = this.allAccountInfo.find(account => account.fakeid === article.fakeid);
-    if (account && account.nickname) {
-      dirnameTpl = dirnameTpl.replace(/\$\{account}/g, filterInvalidFilenameChars(account.nickname));
-    }
+    const accountName = account?.nickname ? filterInvalidFilenameChars(account.nickname) : article.fakeid;
+    dirnameTpl = dirnameTpl.replace(/\$\{account}/g, accountName);
 
     dirnameTpl = dirnameTpl.replace(/\$\{title}/g, filterInvalidFilenameChars(article.title));
     dirnameTpl = dirnameTpl.replace(/\$\{aid}/g, article.aid);

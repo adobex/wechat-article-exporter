@@ -23,9 +23,14 @@ const code = computed(() => {
     throw new Error(`Unknown code: ${JSON.stringify(props.code)}`);
   }
 });
+
+function escapeHtml(value: string): string {
+  return value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+}
+
 const hlCode = computed(() => {
   if (props.lang === 'text') {
-    return `<span class="text-xl">${code.value}</span>`;
+    return `<span class="text-xl">${escapeHtml(code.value)}</span>`;
   }
   return hljs.highlight(code.value, { language: props.lang }).value;
 });

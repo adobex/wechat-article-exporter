@@ -35,6 +35,12 @@ export const ACCOUNT_TYPE: Record<number, string> = {
 export const CREDENTIAL_LIVE_MINUTES: number = 25;
 
 /**
+ * API auth-key 本地保存时间，单位：天
+ */
+export const AUTH_KEY_LIVE_DAYS = 14;
+export const AUTH_KEY_LIVE_SECONDS = 60 * 60 * 24 * AUTH_KEY_LIVE_DAYS;
+
+/**
  * Credentials 服务器主机地址
  */
 export const CREDENTIAL_API_HOST = 'http://127.0.0.1:8088';

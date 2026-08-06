@@ -39,6 +39,7 @@ export default defineEventHandler(async event => {
     endpoint: 'https://mp.weixin.qq.com/cgi-bin/searchbiz',
     query: params,
     parseJson: true,
+    timeoutMs: 25_000,
   }).catch(e => {
     return {
       base_resp: {

@@ -12,13 +12,35 @@ permissions:
   packages: write
 
 env:
-  IMAGE: ghcr.io/wechat-article/wechat-article-exporter
+  IMAGE: ghcr.io/${{ github.repository }}
 
 jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: yarn
+      - name: Enable Yarn
+        run: |
+          corepack enable
+          corepack prepare yarn@1.22.22 --activate
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+      - name: Check and build
+        run: |
+          yarn quality
+          yarn build
+
   # 阶段一：在各架构的「原生」runner 上并行构建，各自推送单架构镜像（-amd64 / -arm64）。
   # 不再用 QEMU 交叉模拟 —— 之前 ARM64 分支在 AMD64 主机上模拟 Node 会崩溃
   # (qemu: uncaught target signal 4 - Illegal instruction)。
   build:
+    needs: verify
     strategy:
       fail-fast: false
       matrix:

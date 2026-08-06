@@ -43,7 +43,7 @@
                 <span v-if="comment.like_num">{{ comment.like_num }}</span>
               </span>
             </p>
-            <p style="font-size: 15px; color: #333; white-space: pre-line" v-html="comment.content"></p>
+            <p style="font-size: 15px; color: #333; white-space: pre-line">{{ comment.content }}</p>
           </div>
         </div>
         <div v-if="comment.reply_new && comment.reply_new.reply_list.length > 0" style="padding-left: 38px">
@@ -64,7 +64,7 @@
               <p style="display: flex; line-height: 16px; margin-bottom: 5px">
                 <span style="margin-right: 5px; font-size: 15px; color: #949494">{{ reply.nick_name }}</span>
                 <span style="margin-right: 5px; font-size: 12px; color: #b5b5b5">{{
-                  reply?.ip_wording?.province_name
+                  getProvinceName(reply)
                 }}</span>
                 <span style="font-size: 12px; color: #b5b5b5">{{ formatAlbumTime(reply.create_time) }}</span>
                 <span style="flex: 1"></span>
@@ -116,6 +116,13 @@
 
 <script setup lang="ts">
 import { formatAlbumTime } from '~/utils/album';
+
+function getProvinceName(reply: unknown): string {
+  if (!reply || typeof reply !== 'object' || !('ip_wording' in reply)) return '';
+  const wording = reply.ip_wording;
+  if (!wording || typeof wording !== 'object' || !('province_name' in wording)) return '';
+  return typeof wording.province_name === 'string' ? wording.province_name : '';
+}
 
 definePageMeta({
   layout: false,

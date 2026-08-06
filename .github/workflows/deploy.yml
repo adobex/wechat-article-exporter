@@ -9,6 +9,8 @@
 #     NUXT_PUBLIC_MEMBERSHIP_ENABLED  —— 是否开启会员/限流层。默认（不设）关闭：
 #                                        fork 私有部署留空即可，无限速、无下线提示。
 #                                        仅官方公开部署需在仓库 Variables 里设为 "true"。
+#     CLOUDFLARE_DEPLOY_ENABLED       —— fork 是否允许自动部署。默认不部署；明确设为 "true"
+#                                        后，push master 或手动触发才会执行部署。
 #
 # 说明：
 # - 会员/限流开关在「构建期」烘入产物；开源项目默认关闭，fork 后不设该变量即不限速。
@@ -23,6 +25,7 @@ on:
 
 jobs:
   deploy:
+    if: ${{ github.repository == 'wechat-article/wechat-article-exporter' || vars.CLOUDFLARE_DEPLOY_ENABLED == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

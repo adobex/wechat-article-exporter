@@ -12,6 +12,12 @@ node_modules
 # Logs
 logs
 *.log
+.local
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
 
 # Misc
 .DS_Store

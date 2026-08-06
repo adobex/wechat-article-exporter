@@ -22,7 +22,7 @@ export async function deleteAccountData(ids: string[]): Promise<void> {
       // const apis = await db.api.toArray();
       // console.log('apis', apis);
 
-      db.api.toCollection().delete();
+      db.table('api').toCollection().delete();
       db.article.where('fakeid').anyOf(ids).delete();
       db.asset.where('fakeid').anyOf(ids).delete();
       db.comment.where('fakeid').anyOf(ids).delete();

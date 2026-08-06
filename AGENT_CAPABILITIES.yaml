@@ -1,0 +1,374 @@
+version: 1
+project_id: wechat-article-exporter
+project_name: WeChat Article Exporter
+description: 微信公众号文章批量下载工具，支持导出文章、评论与阅读数据。
+capabilities:
+  - id: project-entry
+    one_liner: 进入 wechat-article-exporter 项目入口，查看导出能力、部署方式与文档站链接。
+    canonical_entry: ~/Project/tools/wechat-article-exporter/README.md
+    kind: doc
+    priority: 120
+    trigger_keywords:
+      - wechat-article-exporter
+      - 公众号文章
+      - 微信文章导出
+      - mptext
+
+  - id: article-export
+    one_liner: 批量导出微信公众号文章正文、图片与样式，支持 html/json/excel/txt/md/docx 等格式。
+    canonical_entry: ~/Project/tools/wechat-article-exporter/components/setting/Export.vue
+    kind: workflow
+    priority: 116
+    trigger_keywords:
+      - 公众号文章导出
+      - 微信文章下载
+      - html
+      - json
+      - excel
+      - markdown
+      - docx
+      - batch export
+    when_to_use:
+      - 需要批量导出微信公众号文章正文、图片、样式或多格式归档时使用。
+    inputs:
+      - article list、export format、image/style options、output directory 和 credentials/session context。
+    outputs:
+      - html/json/excel/txt/md/docx 导出文件、图片资源和导出日志。
+    side_effects:
+      - 读取公众号文章数据并写入本地导出目录。
+      - 批量导出可能产生大量图片和格式化文件。
+    verification:
+      - command: yarn build
+        purpose: 校验 Nuxt 导出界面和相关依赖编译。
+        when: 修改导出组件或配置后运行。
+    citations:
+      - ref: ~/Project/tools/wechat-article-exporter/components/setting/Export.vue
+      - ref: ~/Project/tools/wechat-article-exporter/README.md
+    updated_at: "2026-06-16"
+
+  - id: metrics-comments-export
+    one_liner: 导出公众号文章的阅读量、评论、回复、转发等数据并支持表格化处理。
+    canonical_entry: ~/Project/tools/wechat-article-exporter/components/grid/ArticleActions.vue
+    kind: workflow
+    priority: 112
+    trigger_keywords:
+      - 阅读量
+      - 评论
+      - 回复
+      - 转发
+      - comment export
+      - read data
+      - excel
+    when_to_use:
+      - 需要导出阅读量、评论、回复、转发等文章指标并表格化处理时使用。
+    inputs:
+      - article ids、credentials/session context、comment range、reply range 和 export format。
+    outputs:
+      - metrics table、comments/replies export、read/share data 和处理日志。
+    side_effects:
+      - 读取需要凭证或抓包上下文的公众号数据，并写入本地表格/导出文件。
+      - 评论和回复导出必须显式限制范围。
+    verification:
+      - command: yarn build
+        purpose: 校验文章操作组件和导出依赖编译。
+        when: 修改指标/评论导出界面后运行。
+    citations:
+      - ref: ~/Project/tools/wechat-article-exporter/components/grid/ArticleActions.vue
+      - ref: ~/Project/tools/wechat-article-exporter/README.md
+    updated_at: "2026-06-16"
+
+  - id: public-api-reference
+    one_liner: 查看开放 API 配置、参数、示例与调试界面。
+    canonical_entry: ~/Project/tools/wechat-article-exporter/config/public-apis.ts
+    kind: doc
+    priority: 108
+    trigger_keywords:
+      - 开放 API
+      - public api
+      - api docs
+      - 接口
+      - DebugModal
+    outputs:
+      - public API 配置、参数说明、示例和调试入口。
+    citations:
+      - ref: ~/Project/tools/wechat-article-exporter/config/public-apis.ts
+
+  - id: local-wechat2md
+    one_liner: 使用本地 API 和 wechat2md 工具链把原始公众号导出转换、清洗、分析到本地目录。
+    canonical_entry: ~/Project/tools/wechat-article-exporter/scripts/wechat2md/README.md
+    kind: workflow
+    priority: 112
+    trigger_keywords:
+      - wechat2md
+      - 本地转换
+      - output/WechatArticles
+      - article-meta
+      - sogou-search
+    inputs:
+      - /Users/adobe/Project/output/WechatArticles 原始导出、article metadata、local API 配置和分析参数。
+    outputs:
+      - .local/wechat2md-analysis/ 清洗结果、二次分析结果和可入库中间产物。
+      - .local/wechat2md-state/ 的共享 lease、high-watermark 和完整性审计状态。
+    side_effects:
+      - 读取本地 WeChatArticles 输出并写入 .local/wechat2md-analysis。
+    execution_notes:
+      - 公众号管理刷新对所有账号先按稳定 biz 合并可验证本地导出，再继续有界公开发现；旧本地记录不会提前结束刷新。部分来源写入会撤销 completed，完整数据源仅作末位探针。普通 Chrome 微信读书发现由通用宿主 workflow 执行，网页不得虚假声称已经启动浏览器或臆断本地文件来源。
+    relations:
+      - type: routes_to
+        target: wechat-article-exporter.wechat2md-kb-import
+        purpose: 二次分析结果确认后进入知识库导入脚本。
+    verification:
+      - command: python3 -m py_compile ~/Project/tools/wechat-article-exporter/scripts/wechat2md/analysis/extract-products.py
+        purpose: 以无写入方式校验 analysis 脚本语法；不要把 --help 当作 harmless 验证。
+        when: 只验证脚本可加载、不执行分析或入库时运行。
+      - command: test -f ~/Project/tools/wechat-article-exporter/scripts/wechat2md/kb-import/batch-products-structured-import.py
+        purpose: 以无写入方式确认 structured/products import 脚本存在。
+        when: 只验证后续导入入口，不执行正式入库。
+    citations:
+      - ref: ~/Project/tools/wechat-article-exporter/scripts/wechat2md/README.md
+    updated_at: "2026-08-05"
+
+  - id: wechat-account-visible-recovery
+    one_liner: 对任意单个公众号按稳定 biz 获取账号资源 lease，并优先复用普通 Chrome 微信读书可见目录做受控补全。
+    canonical_entry: ~/Project/tools/wechat-article-exporter/scripts/wechat2md/workflows/wechat-account-visible-recovery.yaml
+    kind: workflow
+    priority: 113
+    trigger_keywords:
+      - 任意公众号补全
+      - 公众号漏文
+      - 微信读书目录
+      - stable biz
+      - wechat account recovery
+    inputs:
+      - 当前公众号名称、稳定 biz、Asia/Shanghai 日期边界；不使用账号白名单。
+    outputs:
+      - 目标公众号目录下经过稳定身份和正文回验的轻量 Markdown。
+      - 按稳定 biz 派生的账号 lease/state 路径、运行目录快照、官方文章证据和部分覆盖报告。
+    side_effects:
+      - 复用用户已登录的普通 Chrome 可见页面，下载缺失文章，并在 localhost Dashboard 对齐 IndexedDB。
+      - 部分来源不推进完整同步 state、high-watermark 或完整性审计时间。
+    execution_notes:
+      - 先运行 account_resource.mjs 派生资源，再获取同一 stable-biz 账号 lease；busy 时停止该账号，finally 用同一 owner token 释放。
+      - 宿主来源顺序是普通 Chrome 可见微信读书、公开索引、末位完整源探针；不得使用专用浏览器、PC 微信、代理、证书、Cookie/缓存导出或私有列表接口。
+      - 可见目录和官方文章证据捕获后必须运行 visible_catalog_recovery.mjs；它校验 lease、服务输出根目录、目录边界、稳定文章身份和非空正文，只下载审计缺失项并以空批次复跑验证幂等。
+    verification:
+      - command: node ~/Project/tools/wechat-article-exporter/scripts/wechat2md/account_resource.mjs --account-name <name> --stable-biz <biz>
+        purpose: 无写入验证任意账号资源能够按稳定 biz 派生且输出目录受限于 WechatArticles。
+      - command: yarn vitest run tests/account-resource.test.ts tests/local-export-recovery.test.ts tests/visible-catalog-recovery.test.ts tests/data-integrity-client-contracts.test.ts
+        purpose: 验证通用账号资源、官方目录缺失恢复、稳定身份修复、空批次幂等与部分完成状态门禁。
+    citations:
+      - ref: ~/Project/tools/wechat-article-exporter/scripts/wechat2md/workflows/wechat-account-visible-recovery.yaml
+      - ref: ~/Project/tools/wechat-article-exporter/scripts/wechat2md/account_resource.mjs
+      - ref: ~/Project/tools/wechat-article-exporter/scripts/wechat2md/visible_catalog_recovery.mjs
+      - ref: ~/Project/tools/wechat-article-exporter/scripts/wechat2md/README.md
+    updated_at: "2026-08-06"
+
+  - id: wechat2md-automation-lease
+    one_liner: 用 owner-token、续租 heartbeat、原子 run 目录及账号/服务/API 分层 lease 保证同账号互斥、不同账号主体流程可并发。
+    canonical_entry: ~/Project/tools/wechat-article-exporter/scripts/wechat2md/automation_lease.py
+    kind: script
+    priority: 115
+    trigger_keywords:
+      - automation lease
+      - wechat2md lock
+      - owner token
+      - heartbeat
+      - run id
+      - stale TTL
+      - 并发导入
+    inputs:
+      - acquire/status/renew/heartbeat/release 动作、账号/服务/API 资源级 lease 文件、workflow id、完整 UUID owner token 和 TTL。
+      - run_artifact.py 的 workflow id、完整 UUID owner token 和 artifact root。
+      - mp_api_request.py 的请求超时、响应后冷却、限流退避和实际 curl 命令。
+    outputs:
+      - 可机读的 acquired/busy/stale/renewed/released 状态，以及原子预留的唯一 run_id/run_dir。
+    side_effects:
+      - 仅写 .local/wechat2md-state/leases 下的 lease 与 guard 文件；不写文章或 KB 业务数据。
+    verification:
+      - command: /Users/adobe/Project/knowledge-vault/.venv/bin/python -m pytest -q scripts/wechat2md/tests/test_automation_lease.py scripts/wechat2md/tests/test_run_artifact.py scripts/wechat2md/tests/test_mp_api_request.py scripts/wechat2md/tests/test_workflows.py
+        purpose: 验证原子 acquire、owner renew/release、heartbeat 失败停机、stale takeover、完整 UUID run 目录冲突重试、双 worker 响应后间隔和限流退避续租。
+    citations:
+      - ref: ~/Project/tools/wechat-article-exporter/scripts/wechat2md/automation_lease.py
+      - ref: ~/Project/tools/wechat-article-exporter/scripts/wechat2md/run_artifact.py
+      - ref: ~/Project/tools/wechat-article-exporter/scripts/wechat2md/mp_api_request.py
+      - ref: ~/Project/tools/wechat-article-exporter/scripts/wechat2md/workflows/indienova-steam-incremental.yaml
+      - ref: ~/Project/tools/wechat-article-exporter/scripts/wechat2md/workflows/wechat-product-accounts-incremental.yaml
+    updated_at: "2026-08-03"
+
+  - id: indienova-steam-incremental-import
+    one_liner: 通过 indienova 账号级 lease、独立状态、动态有界 overlap 和周期完整性审计同步 Steam 文章，并只导入唯一 run 清单。
+    canonical_entry: ~/Project/tools/wechat-article-exporter/scripts/wechat2md/workflows/indienova-steam-incremental.yaml
+    kind: workflow
+    priority: 114
+    trigger_keywords:
+      - indienova
+      - steam 文章
+      - Steam 新品节
+      - 保留 CDN 链接
+      - 轻量版
+      - 本轮新下载
+      - import-steam-indienova
+    inputs:
+      - 现有 wechat-article-exporter 登录态、indienova 公众号 fakeid、标题关键词 steam、发布时间下限 2020-01-01。
+      - /Users/adobe/Project/output/WechatArticles 输出根目录和本轮新下载文章清单。
+      - 持久 sync state；正常窗口动态扩展，周期审计固定扫描到 2020-01-01。
+    outputs:
+      - /Users/adobe/Project/output/WechatArticles/indienova 下的轻量 Markdown 文章，图片保留 CDN 链接。
+      - /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-runs/indienova-steam-<run_id>-files.json 本轮文件清单。
+      - knowledge-vault 的 raw/steam/indienova 和 documents/steam:* 记录。
+    side_effects:
+      - 下载公众号文章到本地输出目录。
+      - 调用 Steam 匹配/补全并写入 knowledge-vault Steam 文档记录。
+      - 不自动执行 build-steam-catalog-index.py、rebuild-kb-store.py 或任何全量索引重建。
+    execution_notes:
+      - 执行前必须读取 canonical_entry 指向的 workflow yaml；该文件是本流程的执行源。
+      - 只持有 indienova 账号级 owner-token lease；localhost 服务仅在启动转换时使用短 lease，正式 Steam document 写入同时要求 --file-list 与 --confirm。
+      - 能力清单只负责路由，不在这里复制下载参数、file-list 规则或禁止命令。
+    verification:
+      - command: curl --fail --silent --show-error http://localhost:3000/api/local/wechat2md/credentials | jq -e '.success == true and .outputDir == "/Users/adobe/Project/output/WechatArticles"'
+        purpose: 验证 localhost 服务确实启用了 workflow 所需本地 API 且绑定精确输出根目录，而不只是首页可访问。
+      - command: python3 ~/Project/knowledge-vault/scripts/import-steam-indienova.py --source-dir /Users/adobe/Project/output/WechatArticles/indienova --file-list <manifest> --dry-run --no-fetch
+        purpose: 验证本轮文件清单解析范围，不写 KB。
+      - command: 检查本轮下载文章目录无 images/ 子目录，Markdown 无本地 images/ 引用。
+        purpose: 验证“保留 CDN 链接”配置真实生效。
+    citations:
+      - ref: ~/Project/tools/wechat-article-exporter/scripts/wechat2md/workflows/indienova-steam-incremental.yaml
+      - ref: ~/Project/tools/wechat-article-exporter/scripts/wechat2md/README.md
+      - ref: ~/Project/tools/wechat-article-exporter/server/api/local/wechat2md.post.ts
+      - ref: ~/Project/tools/wechat-article-exporter/server/utils/wechat2md.ts
+      - ref: ~/Project/knowledge-vault/scripts/import-steam-indienova.py
+    updated_at: "2026-08-03"
+
+  - id: wechat-product-accounts-incremental-import
+    one_liner: 通过账号 lease/state、动态 overlap、周期审计、微信读书网页补全及可信镜像受控恢复同步产品账号，再以质量 receipt 写 structured/products。
+    canonical_entry: ~/Project/tools/wechat-article-exporter/scripts/wechat2md/workflows/wechat-product-accounts-incremental.yaml
+    kind: workflow
+    priority: 114
+    trigger_keywords:
+      - 游戏吗喽说
+      - 新游观察
+      - 王董的新游戏
+      - 产品蒸馏
+      - 产品分析入库
+      - 公众号文章产品
+      - wechat product import
+    inputs:
+      - 现有 wechat-article-exporter 登录态、三个目标公众号、发布时间下限 2025-01-01；profile_ext 仅使用 localhost 进程内未过期 Credential，微信读书和公开索引只提供部分覆盖。
+      - /Users/adobe/Project/output/WechatArticles 输出根目录和本轮新下载文章清单。
+      - 持久分账号 sync state；正常窗口动态扩展，周期审计固定扫描到 2025-01-01。
+    outputs:
+      - 三个公众号各自目录下的轻量 Markdown 文章，图片保留 CDN 链接。
+      - /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-runs/product-accounts-<run_id>-files.json 本轮文件清单。
+      - .local/wechat2md-analysis 产品分析产物和 knowledge-vault structured/products 产品向入库记录。
+      - standalone quality report、SHA256 import receipt、publisher conflict needs-review 报告。
+      - 每账号 primary/profile_ext/WeRead/public-index 扫描源、覆盖状态、Credential cache 状态和备用源告警。
+      - 每账号微信读书首批条数、实际滚动次数、最终目录条数、日期边界状态、目录缺口/歧义/日期修复数、可信镜像恢复数和仍未解决的部分来源文章数。
+      - 本地 Dashboard 对齐后新增的文章/消息数、跳过的不可稳定归属记录数和账号文章总数。
+    side_effects:
+      - 下载公众号文章到本地输出目录。
+      - 写入 .local/wechat2md-analysis。
+      - 产品 structured import 会写 knowledge-vault documents 和 structured/products runtime；legacy wiki import 与 legacy product:osint 脚本不在本 workflow 默认链路内。
+      - 历史 legacy wiki 误落点修复必须先 structured backfill，再用 cleanup-legacy-product-wiki-import.py 清 active wiki JSONL/embedding；不要用 batch-wiki-import.py 反向补救。
+    execution_notes:
+      - 执行前必须读取 canonical_entry 指向的 workflow yaml；该文件是本流程的执行源。
+      - 每个账号独立 acquire/release；busy 账号单独跳过，其他账号与 Steam workflow 继续执行。structured/products 只在 confirm 写入阶段使用内部 writer lock。
+      - 三个产品账号分别复用通用 visible-recovery contract：先用用户已打开并登录的普通 Chrome 读取微信读书官方可见目录，再按需降级公开索引；appmsgpublish/profile_ext 只作为末位完整性探针，已知 200013 时不先调用。不得启动专用资料目录或其他浏览器，不使用 PC 微信、系统代理、证书、缓存凭据、Cookie 导出或私有列表接口。目录首批只是懒加载窗口，必须物理滚动并记录条数增长直到越过日期边界，再用 weread_catalog_audit.mjs 区分缺文件、歧义和错误日期。逐项打开缺失目录文章，从渲染正文提取官方微信原文地址并回验 biz、标题、日期和正文；结果仅计部分覆盖，永不推进 sync state 或完成完整性审计。
+      - 本地文件补齐后，先用逐篇官方证据、显式备份和 weread_catalog_audit.mjs 回填唯一匹配且缺少稳定身份的短链接；稳定 biz/mid/idx 冲突必须停止。随后在普通 Chrome 的公众号管理页只选择目标账号并执行“对齐本地导出”；仅允许匹配账号名且带稳定 biz、显式正整数 mid/idx 的记录进入该账号 IndexedDB。第二次对齐必须新增 0 篇，文章页须能按标题和日期检索全部官方证据文章；此步骤不改变 workflow sync state。
+      - 搜狗公开索引只作微信读书非人工阻塞失败后的降级补充。可信镜像只允许恢复有精确标题和日期证据、且账号、微信原文链接和非空正文全部匹配的单篇候选。所有部分来源下载都必须回验目标 stable biz，不得生成标题占位 Markdown。
+      - 能力清单只负责路由，不在这里复制下载参数、产品分析脚本细节或禁止命令。
+    verification:
+      - command: curl --fail --silent --show-error http://localhost:3000/api/local/wechat2md/credentials | jq -e '.success == true and .outputDir == "/Users/adobe/Project/output/WechatArticles"'
+        purpose: 验证 localhost 服务确实启用了 workflow 所需本地 API 且绑定精确输出根目录，而不只是首页可访问。
+      - command: ruby -e 'require "yaml"; YAML.load_file("scripts/wechat2md/workflows/wechat-product-accounts-incremental.yaml")'
+        purpose: 验证 workflow 配置可解析。
+      - command: yarn vitest run tests/profile-ext-fallback.test.ts tests/weread-reader-url.test.ts tests/weread-catalog-audit.test.ts tests/public-article-discovery.test.ts tests/public-mirror.test.ts tests/wechat2md-canonical-url.test.ts tests/markdown-sanitizer.test.ts tests/security-html.test.ts
+        purpose: 验证 profile_ext 多图文适配、Credential 到期与脱敏、微信读书官方阅读页稳定路由、目录懒加载边界及元数据修复门禁、公开索引回验、可信镜像约束以及正文下载 stable biz 门禁。
+      - command: python3 scripts/wechat2md/analysis/publisher-analysis.py --source-dir /Users/adobe/Project/output/WechatArticles --file-list <manifest> --output-dir <run-analysis-dir> --dry-run
+        purpose: 验证产品分析只处理本轮 manifest 文件，不扫描旧目录。
+      - command: python3 scripts/wechat2md/kb-import/batch-products-structured-import.py --data-json <run-analysis-json> --receipt-json <run-receipt-json> --dry-run
+        purpose: 写入绑定当前输入 SHA256、候选摘要和质量状态的 receipt，不写 documents 或 structured runtime。
+      - command: python3 ~/Project/knowledge-vault/scripts/search-structured-kb.py --kb products <new-product-name> --limit 3 --mode thin --envelope
+        purpose: 验证正式 products structured runtime 可检索本轮入库产品。
+      - command: python3 scripts/wechat2md/kb-import/cleanup-wechat-products-structured-noise.py --dry-run
+        purpose: 验证 active structured/products 中没有 WeChat product-analysis 噪声候选。
+      - command: 检查本轮 successful downloads 数量等于唯一 index.md 路径数量。
+        purpose: 防止同公众号同标题文章互相覆盖后仍被误判为下载成功。
+      - command: 检查本轮下载文章目录无 images/ 子目录，Markdown 无本地 images/ 引用。
+        purpose: 验证“保留 CDN 链接”配置真实生效。
+    citations:
+      - ref: ~/Project/tools/wechat-article-exporter/scripts/wechat2md/workflows/wechat-product-accounts-incremental.yaml
+      - ref: ~/Project/tools/wechat-article-exporter/scripts/wechat2md/README.md
+      - ref: ~/Project/tools/wechat-article-exporter/scripts/wechat2md/weread_reader_url.mjs
+      - ref: ~/Project/tools/wechat-article-exporter/scripts/wechat2md/weread_catalog_audit.mjs
+      - ref: ~/Project/tools/wechat-article-exporter/scripts/wechat2md/analysis/extract-products.py
+      - ref: ~/Project/tools/wechat-article-exporter/scripts/wechat2md/analysis/publisher-analysis.py
+      - ref: ~/Project/tools/wechat-article-exporter/scripts/wechat2md/kb-import/README.md
+    updated_at: "2026-08-05"
+
+  - id: wechat2md-kb-import
+    one_liner: 将 wechat2md 二次分析结果写入知识库，当前产品向默认落点是 knowledge-vault structured/products。
+    canonical_entry: ~/Project/tools/wechat-article-exporter/scripts/wechat2md/kb-import/batch-products-structured-import.py
+    kind: script
+    reuses:
+      - target: knowledge-vault.kb-ingest
+        purpose: 复用 Knowledge Vault 写入入口、目标 KB 归属和入库验收边界。
+        when: wechat2md 二次分析结果需要进入知识库。
+    priority: 106
+    trigger_keywords:
+      - wechat2md 入库
+      - kb import
+      - batch products import
+      - structured products import
+      - publisher analysis
+      - known products
+    inputs:
+      - 显式 --data-json、embedded quality、可选 subject filter、dry-run receipt 和 KB 目标归属。
+    outputs:
+      - products source documents、structured/products records、publisher/product analysis records 和导入日志。
+    side_effects:
+      - 写入 knowledge-vault documents 和 structured/products runtime。
+      - 正式导入必须验证未过期 receipt 与 quality hard gate；document/runtime 共用单 writer lock、staging 和失败回滚。
+      - 同 slug 合并全部来源，publisher conflict 进入 needs-review 且无 stable edge。
+    relations:
+      - type: depends_on
+        target: wechat-article-exporter.local-wechat2md
+        purpose: 只消费本地二次分析结果。
+    citations:
+      - ref: ~/Project/tools/wechat-article-exporter/scripts/wechat2md/kb-import/batch-products-structured-import.py
+      - ref: ~/Project/tools/wechat-article-exporter/scripts/wechat2md/kb-import/cleanup-legacy-product-wiki-import.py
+      - ref: ~/Project/tools/wechat-article-exporter/scripts/wechat2md/kb-import/cleanup-wechat-products-structured-noise.py
+      - ref: ~/Project/knowledge-vault/skills/kb-ingest/SKILL.md
+    updated_at: "2026-07-10"
+
+  - id: deployment
+    one_liner: 构建、预览、Docker 发布或 Cloudflare Pages/Workers 部署 wechat-article-exporter。
+    canonical_entry: ~/Project/tools/wechat-article-exporter/package.json
+    kind: workflow
+    priority: 102
+    trigger_keywords:
+      - yarn dev
+      - yarn build
+      - yarn preview
+      - docker build
+      - Cloudflare
+      - Docker 部署
+    inputs:
+      - version、Nuxt build config、Cloudflare Pages/Workers config、Docker tag 和 publish credentials。
+    outputs:
+      - Nuxt build、preview site、Docker image、Cloudflare deployment 或 release artifact。
+      - 本地 dev server 访问链接固定为 http://localhost:3000/；不要替换为 http://127.0.0.1:3000/，避免浏览器 IndexedDB 按 origin 分仓导致旧数据不可见。
+    side_effects:
+      - build 写入本地产物；Docker/Cloudflare publish 会产生远程发布副作用。
+    verification:
+      - command: yarn build
+        purpose: 构建 Nuxt 产物。
+      - command: curl -I http://localhost:3000/
+        purpose: 启动本地 dev server 后验证用户应访问的 localhost origin。
+        when: 执行 `yarn dev` 后给用户链接前运行。
+      - command: yarn preview
+        purpose: 启动 Cloudflare Pages preview。
+        when: 部署前需要本地预览时运行。
+    citations:
+      - ref: ~/Project/tools/wechat-article-exporter/package.json
+      - ref: ~/Project/tools/wechat-article-exporter/CONTRIBUTING.md
+    updated_at: "2026-07-01"
