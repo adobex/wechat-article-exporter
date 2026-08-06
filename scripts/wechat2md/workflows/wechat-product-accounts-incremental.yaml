@@ -1,6 +1,6 @@
-version: 14
+version: 15
 id: wechat-product-accounts-incremental
-updated_at: "2026-08-05"
+updated_at: "2026-08-06"
 owner_project: wechat-article-exporter
 purpose: >
   Incrementally sync selected WeChat public accounts, download newly missing
@@ -24,15 +24,18 @@ run_identity:
 account_leases:
   helper: /Users/adobe/Project/tools/wechat-article-exporter/scripts/wechat2md/automation_lease.py
   path_template: /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-state/leases/accounts/<account.state_key>.json
+  migration_bridge_order:
+    - account.legacy_lease_file
+    - account.lease_file
   ttl_seconds: 3600
-  owner_token_policy: Retain the run owner token in process memory and use it for every account lease acquired by this run.
-  acquire_command: python3 scripts/wechat2md/automation_lease.py acquire --lease-file <account.lease_file> --workflow-id wechat-product-accounts-incremental:<account.state_key> --owner-token <owner_token> --ttl-seconds 3600
-  busy_policy: Record the busy account as skipped and continue with other accounts; never release a lease owned by another token.
-  held_scope: Hold each acquired account lease across that account's scan/download plus the shared manifest, analysis, formal product import, verification, and that account's state update.
-  heartbeat_command: python3 scripts/wechat2md/automation_lease.py heartbeat --lease-file <account.lease_file> --owner-token <owner_token> --ttl-seconds 3600 --interval-seconds 300 --max-lifetime-seconds 43200 --quiet
-  heartbeat_policy: Start and monitor one heartbeat per acquired account lease. If any heartbeat exits, reaches its 12-hour maximum lifetime, or owner-checked renewal fails, stop before further download, --confirm, or state writes for that account.
-  finally_release: In a finally block, release every acquired account lease with the same owner token on success, failure, cancellation, or partial execution.
-  release_command: python3 scripts/wechat2md/automation_lease.py release --lease-file <account.lease_file> --owner-token <owner_token>
+  owner_token_policy: Retain the run owner token in process memory and use it for each account's acquire-set, heartbeat-set, and release-set.
+  acquire_command: python3 scripts/wechat2md/automation_lease.py acquire-set --lease-file <account.legacy_lease_file> --lease-file <account.lease_file> --workflow-id wechat-product-accounts-incremental:<account.state_key> --owner-token <owner_token> --ttl-seconds 3600
+  busy_policy: Record the account as skipped when either its legacy bridge lease or canonical lease is busy and continue with other accounts; never release a lease owned by another token.
+  held_scope: Hold both account lease paths across that account's scan/download plus the shared manifest, analysis, formal product import, verification, and that account's state update. Acquiring the legacy path first blocks old display-name executors before canonical acquisition.
+  heartbeat_command: python3 scripts/wechat2md/automation_lease.py heartbeat-set --lease-file <account.legacy_lease_file> --lease-file <account.lease_file> --owner-token <owner_token> --ttl-seconds 3600 --interval-seconds 300 --max-lifetime-seconds 43200 --quiet
+  heartbeat_policy: Start and monitor one set heartbeat per acquired account. If either lease renewal fails or the heartbeat reaches its 12-hour maximum lifetime, stop before further download, --confirm, or state writes for that account.
+  finally_release: In a finally block, release-set both paths for every acquired account with the same owner token on success, failure, cancellation, or partial execution.
+  release_command: python3 scripts/wechat2md/automation_lease.py release-set --lease-file <account.legacy_lease_file> --lease-file <account.lease_file> --owner-token <owner_token>
 
 service_startup_lease:
   helper: /Users/adobe/Project/tools/wechat-article-exporter/scripts/wechat2md/automation_lease.py
@@ -56,7 +59,7 @@ authenticated_api_lease:
     - 30
     - 60
     - 120
-  scope: Serialize only authenticated /api/web/mp/searchbiz, /api/web/mp/appmsgpublish, and local profile_ext fallback requests that reach WeChat; downloads, analysis, and imports never hold this lease.
+  scope: Serialize only authenticated /api/web/mp/appmsgpublish and local profile_ext final-probe requests that reach WeChat; downloads, analysis, and imports never hold this lease.
   command_template: python3 scripts/wechat2md/mp_api_request.py --lease-file <lease_file> --owner-token <owner_token> --workflow-id wechat-product-accounts-incremental:wechat-mp-api --lease-ttl-seconds 300 --wait-timeout-seconds 300 --request-timeout-seconds 30 --cooldown-seconds 2 --backoff-seconds 30,60,120 -- <curl request>
   request_policy: Every authenticated request must run through request_helper, which holds the API lease through the response and the full 2-second post-response cooldown before owner-checked release.
   timeout_policy: The localhost MP proxy starts its 25-second budget at proxy entry, aborts the upstream WeChat fetch before request_helper's 30-second client timeout, and refuses to start upstream work when the client already disconnected during token or cookie lookup.
@@ -71,11 +74,28 @@ concurrency:
   import_policy: Product confirm writes remain serialized only inside batch-products-structured-import.py by its structured-ai-products writer lock; scans, downloads, dry-runs, and Steam imports do not use that lock.
 
 sync_state:
+  helper: /Users/adobe/Project/tools/wechat-article-exporter/scripts/wechat2md/sync_state.py
   scope: one_file_per_account
   path_template: /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-state/accounts/<account.state_key>.json
   legacy_read_fallback: /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-state/wechat-product-accounts-incremental.json
-  migration: When an account state is absent, first read account.legacy_state_path, then only that account's entry from legacy_read_fallback. Leave both legacy sources untouched and publish the stable-biz state_path only after the account's fully verified batch succeeds.
-  persistence: Write a temporary JSON file and atomically replace the state file only after the whole leased workflow and its verification succeed.
+  migration: When an account state is absent, validate account.legacy_state_path and only that account's entry from legacy_read_fallback without modifying either. Use the only valid candidate, or one value when all valid candidates are semantically identical. If valid candidates conflict, treat state as missing, force the full date-floor integrity audit, report a per-account migration conflict, and publish stable-biz state only after the complete audit and every downstream gate succeeds.
+  snapshot_file_template: <run_dir>/<account.state_key>-state-snapshot.json
+  candidate_file_template: <run_dir>/<account.state_key>-state-candidate.json
+  gate_file_template: <run_dir>/<account.state_key>-state-gate.json
+  snapshot_command: python3 scripts/wechat2md/sync_state.py snapshot --state-file <account.state_path> --snapshot-file <account_snapshot_file>
+  gate_schema:
+    complete_source_probe_succeeded: true only after full overlap/date-floor pagination for this account
+    required_integrity_audit_completed: true when no audit is due or the required full audit completed
+    manifest_and_downstream_succeeded: true only for an empty verified no-op or successful analysis, receipt, and confirm
+    lease_heartbeat_active: true only after both legacy and canonical account lease ownership are rechecked
+    post_write_verification_succeeded: true only after structured retrieval and noise verification succeed
+    state_migration_safe: true when no legacy conflict exists or the conflict was resolved by a completed full audit
+  pre_run_snapshot: Run snapshot_command before scanning each account to record existence and the exact SHA256. Partial-source success, a skipped or failed complete probe, analysis/import/heartbeat failure, cancellation, or any verification error must preserve the same existence and SHA256.
+  commit_gate: Write every gate_schema field to the account gate file and call publish_command. The helper rejects any value other than literal true, rechecks the snapshot before writing, and atomically replaces account.state_path only after all gates pass.
+  publish_command: python3 scripts/wechat2md/sync_state.py publish --state-file <account.state_path> --snapshot-file <account_snapshot_file> --candidate-file <account_candidate_file> --gate-file <account_gate_file> --lease-file <account.legacy_lease_file> --lease-file <account.lease_file> --owner-token <owner_token>
+  failure_verification: On every path where commit_gate is false, run failure_verification_command and require unchanged=true before reporting completion.
+  failure_verification_command: python3 scripts/wechat2md/sync_state.py verify-unchanged --state-file <account.state_path> --snapshot-file <account_snapshot_file>
+  persistence: After an owner-workflow-gated snapshot compare, sync_state.py will atomically replace from the same directory only when the whole leased workflow and its verification succeed.
   per_account_schema:
     high_watermark_publish_timestamp: newest successfully reconciled publish timestamp
     high_watermark_article_ids: article ids observed at that timestamp
@@ -97,7 +117,7 @@ service:
   lifecycle: Shared singleton coordinated by service_startup_lease; reuse an already healthy service.
 
 auth:
-  mode: existing_session_with_ephemeral_profile_fallback
+  mode: normal_chrome_visible_recovery_with_final_authenticated_probe
   auth_key_source: local cookie store used by wechat-article-exporter
   request_header: X-Auth-Key
   chrome_policy: Reuse the user's already-open normal Google Chrome only for relogin or the official WeRead visible-page fallback. Never launch a dedicated or alternate browser profile.
@@ -116,6 +136,7 @@ accounts:
     state_key: wechat-account-98358f377fae9cfdde83
     state_path: /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-state/accounts/wechat-account-98358f377fae9cfdde83.json
     legacy_state_path: /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-state/accounts/product-youxi-malou-shuo.json
+    legacy_lease_file: /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-state/leases/accounts/product-youxi-malou-shuo.json
     lease_file: /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-state/leases/accounts/wechat-account-98358f377fae9cfdde83.json
     search_keyword: 游戏吗喽说
     output_dir: /Users/adobe/Project/output/WechatArticles/游戏吗喽说
@@ -124,6 +145,7 @@ accounts:
     state_key: wechat-account-b32f5809900e0e3e9ab9
     state_path: /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-state/accounts/wechat-account-b32f5809900e0e3e9ab9.json
     legacy_state_path: /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-state/accounts/product-xinyou-guancha.json
+    legacy_lease_file: /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-state/leases/accounts/product-xinyou-guancha.json
     lease_file: /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-state/leases/accounts/wechat-account-b32f5809900e0e3e9ab9.json
     search_keyword: 新游观察
     output_dir: /Users/adobe/Project/output/WechatArticles/新游观察
@@ -132,6 +154,7 @@ accounts:
     state_key: wechat-account-f6997a8037821025d30b
     state_path: /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-state/accounts/wechat-account-f6997a8037821025d30b.json
     legacy_state_path: /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-state/accounts/product-wangdong-xinyouxi.json
+    legacy_lease_file: /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-state/leases/accounts/product-wangdong-xinyouxi.json
     lease_file: /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-state/leases/accounts/wechat-account-f6997a8037821025d30b.json
     search_keyword: 王董的新游戏
     output_dir: /Users/adobe/Project/output/WechatArticles/王董的新游戏
@@ -143,12 +166,14 @@ article_scan:
       - local_canonical_export_reconciliation
       - weread_chrome_fallback
       - public_index_fallback
-    complete_source_probe: appmsgpublish and profile_ext are completeness probes only. Do not call them before the preferred acquisition path when the session is already known to return frequency control; a successful complete probe may still advance state under the existing gates.
-    dashboard_rule: The public-account manager follows generic_account_recovery.canonical_entry for every account. It reconciles canonical local records and then continues bounded public discovery even when old local records exist; authenticated complete sources are a final probe only when preferred sources are unavailable.
+      - authenticated_complete_source_probe
+    complete_probe_identity: Reuse account.stable_biz directly as the appmsgpublish fakeid. Do not call searchbiz merely to rediscover these validated accounts.
+    complete_source_probe: appmsgpublish and profile_ext are final completeness probes only. Attempt them after the preferred acquisition and partial fallback path, and skip them when current source-health evidence already marks the authenticated list path frequency controlled; only a successful complete probe may advance state under the existing gates.
+    dashboard_rule: The public-account manager follows generic_account_recovery.canonical_entry for every account. It reconciles canonical local records and then continues bounded public discovery even when old local records exist; an authenticated complete source may run only afterward as an optional final state-completeness probe when current source health permits.
   complete_probe_endpoint: /api/web/mp/appmsgpublish
   profile_ext_fallback:
     endpoint: /api/local/wechat2md/article-list
-    trigger: Use only as an explicit complete-source probe after local/WeRead acquisition, or when the preferred visible-page source is unavailable and current source-health evidence does not already mark the authenticated list path frequency controlled.
+    trigger: Use only as an explicit final complete-source probe after local reconciliation, WeRead acquisition, and any eligible public-index fallback, and only when current source-health evidence does not already mark the authenticated list path frequency controlled.
     credential_preflight: Query GET /api/local/wechat2md/credentials and require a fresh entry whose biz exactly matches the selected account fakeid; never send Credential secrets from the automation request.
     request_policy: Run every fallback page request through authenticated_api_lease because the local endpoint still reaches WeChat. Pass only id, begin, and size to localhost.
     response_contract: Require source=profile_ext, base_resp.ret=0, articles as a normalized flat list, can_continue, and next_offset. The adapter expands primary and multi_app_msg_item_list entries, rejects deleted entries and non-mp.weixin.qq.com links, and derives stable aid values from mid plus idx.
@@ -156,7 +181,7 @@ article_scan:
     maximum_pages_per_account: 500
     progress_guard: Track every requested offset and a SHA256 signature of each page's ordered canonical aid/link list. Require next_offset to be greater than the current offset and previously unseen; stop the account on a repeated offset, repeated page signature, or page-limit breach.
     progress_failure_policy: Treat any progress-guard breach as a scan failure, preserve the previous per-account sync state, and do not continue requesting pages.
-    unavailable_policy: If the matching Credential is absent or expired, or fallback returns a nonzero ret including frequency control, continue to weread_chrome_fallback. Preserve the previous per-account sync state regardless of partial-source results.
+    unavailable_policy: If the matching Credential is absent or expired, or the probe returns a nonzero ret including frequency control, retain already verified partial-source downloads, report the complete probe as unavailable, and preserve the previous per-account sync state. Never loop back to an already attempted source.
     source_consistency: A complete-source probe may switch from appmsgpublish to profile_ext, but high-watermark identity remains publish timestamp plus canonical aid; never merge duplicate links twice.
   weread_chrome_fallback:
     trigger: Use as the default discovery and acquisition source for the workflow accounts whenever the user's normal Chrome is available and signed in; do not wait for appmsgpublish or profile_ext to fail first.
@@ -185,7 +210,7 @@ article_scan:
     unavailable_policy: An existing_chrome_unavailable, login_required, or captcha_required result stops that account with an actionable warning and never switches browser. Other visible-page failures may continue only to public_index_fallback as explicitly degraded partial recovery.
   public_index_fallback:
     endpoint: /api/local/public-article-discovery
-    trigger: Use only after the complete sources and weread_chrome_fallback are unavailable for a non-user-action reason, or when selected explicitly for degraded login-free partial recovery.
+    trigger: Run as a bounded independent supplement after successful weread_chrome_fallback reconciliation, or after a non-user-action visible-source failure. Do not use it to bypass login_required, captcha_required, or existing_chrome_unavailable, and run it before any authenticated complete-source probe.
     request_body: Pass accountName=account.name, expectedBiz=account.stable_biz, and notBefore equal to the active overlap or audit date boundary.
     request_policy: Public Sogou and WeChat article requests use the endpoint's bounded 3.5-second and 3-second gates plus a 15-second per-request timeout; they do not use authenticated_api_lease and never read browser cookies, storage, or Credential secrets.
     query_bounds: Use only the endpoint's fixed account-specific profile, at most 3 queries covering the account, current year, and active date-floor year, follow actual next-page links for at most 10 pages per query, and verify at most 300 date-eligible exact-account candidates after stable Sogou document-ID deduplication.
@@ -351,6 +376,7 @@ report:
     - file_manifest
     - lease_result
     - per_account_lease_results
+    - per_account_legacy_bridge_lease_results
     - service_startup_lease_result
     - service_compatibility_result
     - authenticated_api_lease_result
@@ -404,3 +430,6 @@ report:
     - import_skipped_count
     - import_error_count
     - product_structured_import_status
+    - per_account_state_migration_results
+    - per_account_sync_state_snapshot_results
+    - per_account_sync_state_gate_results

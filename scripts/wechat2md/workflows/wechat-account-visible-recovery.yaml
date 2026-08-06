@@ -1,5 +1,6 @@
-version: 1
+version: 2
 workflow_id: wechat-account-visible-recovery
+updated_at: "2026-08-06"
 purpose: Recover recent or historical articles for any single WeChat public account with stable identity, without relying on a hard-coded account catalog.
 
 scope:
@@ -44,11 +45,12 @@ source_priority:
   dashboard_refresh:
     - reconcile every canonical local record for stable_biz, including records written under a prior account name
     - continue to the bounded public index even when local records already exist
-    - use authenticated complete sources only as a final probe when local and public sources are unavailable
+    - optionally use authenticated complete sources after partial-source reconciliation as a final state-completeness probe, but only when current source health permits
   host_acquisition:
     - normal_chrome_visible_weread
     - public_index_fallback
     - authenticated_complete_source_probe
+  partial_supplement_rule: After a successful WeRead reconciliation, still run the bounded public index as an independent partial supplement because either source may omit articles. A login_required, captcha_required, or existing_chrome_unavailable stop is never bypassed with another browser; only non-user-action visible-source failures may degrade directly to the public index.
   blocked_source_rule: A source already known to return frequency control is never the first request of a new refresh or host recovery run.
 
 normal_chrome_visible_weread:
@@ -78,7 +80,7 @@ authenticated_complete_source_probe:
   endpoints:
     - /api/web/mp/appmsgpublish
     - /api/local/wechat2md/article-list
-  trigger: Last resort only after preferred sources are unavailable and current source-health evidence does not already mark the authenticated path frequency controlled.
+  trigger: Final state-completeness probe after preferred and partial-source reconciliation, regardless of whether those partial sources found articles. Skip when current source-health evidence marks the authenticated path frequency controlled or no fresh authenticated session is available.
   request_policy: Use the shared authenticated API lease and bounded frequency-control handling from mp_api_request.py.
   success_policy: Only a fully paginated, overlap-complete or date-floor-complete probe may update complete-sync state.
 

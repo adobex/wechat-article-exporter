@@ -94,6 +94,91 @@ def test_same_owner_acquire_is_idempotent(tmp_path):
     assert again["result"] == "already-owned"
 
 
+def test_acquire_set_holds_legacy_bridge_before_canonical_lease(tmp_path):
+    module = load_module()
+    legacy = tmp_path / "legacy.json"
+    canonical = tmp_path / "canonical.json"
+
+    acquired = module.acquire_lease_set(
+        [legacy, canonical],
+        owner_token="new-owner",
+        ttl_seconds=60,
+        workflow_id="new-workflow",
+    )
+    old_executor = module.acquire_lease(
+        legacy,
+        owner_token="old-owner",
+        ttl_seconds=60,
+        workflow_id="old-workflow",
+    )
+    competing_new_executor = module.acquire_lease(
+        canonical,
+        owner_token="other-new-owner",
+        ttl_seconds=60,
+        workflow_id="new-workflow",
+    )
+
+    assert acquired["acquired"] is True
+    assert old_executor["result"] == "busy"
+    assert competing_new_executor["result"] == "busy"
+    assert module.release_lease_set([legacy, canonical], owner_token="new-owner")["released"] is True
+    assert not legacy.exists()
+    assert not canonical.exists()
+
+
+def test_acquire_set_rolls_back_bridge_when_canonical_is_busy(tmp_path):
+    module = load_module()
+    legacy = tmp_path / "legacy.json"
+    canonical = tmp_path / "canonical.json"
+    module.acquire_lease(
+        canonical,
+        owner_token="existing-owner",
+        ttl_seconds=60,
+        workflow_id="new-workflow",
+    )
+
+    result = module.acquire_lease_set(
+        [legacy, canonical],
+        owner_token="candidate-owner",
+        ttl_seconds=60,
+        workflow_id="new-workflow",
+    )
+
+    assert result["acquired"] is False
+    assert result["busy_lease_file"] == str(canonical.resolve())
+    assert result["rollback"][0]["result"] == "released"
+    assert not legacy.exists()
+    assert module.lease_status(canonical)["lease"]["owner_token"] == "existing-owner"
+
+
+def test_release_set_preserves_legacy_bridge_when_canonical_owner_is_lost(tmp_path):
+    module = load_module()
+    legacy = tmp_path / "legacy.json"
+    canonical = tmp_path / "canonical.json"
+    module.acquire_lease_set(
+        [legacy, canonical],
+        owner_token="original-owner",
+        ttl_seconds=60,
+        workflow_id="new-workflow",
+    )
+    module.release_lease(canonical, owner_token="original-owner")
+    module.acquire_lease(
+        canonical,
+        owner_token="replacement-owner",
+        ttl_seconds=60,
+        workflow_id="new-workflow",
+    )
+
+    result = module.release_lease_set([legacy, canonical], owner_token="original-owner")
+
+    assert result["released"] is False
+    assert result["leases"][0]["result"] == "owner-token-mismatch"
+    assert result["unreleased_lease_files"] == [str(legacy.resolve())]
+    assert module.lease_status(legacy)["lease"]["owner_token"] == "original-owner"
+    module.release_lease(legacy, owner_token="original-owner")
+    module.release_lease(canonical, owner_token="replacement-owner")
+
+
 def test_owner_checked_renewal_extends_lease_beyond_original_ttl(tmp_path):
     module = load_module()
     lease = tmp_path / "account.json"

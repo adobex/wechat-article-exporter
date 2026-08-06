@@ -1,11 +1,17 @@
-version: 5
+version: 6
 id: indienova-steam-incremental
-updated_at: "2026-08-03"
+updated_at: "2026-08-06"
 owner_project: wechat-article-exporter
 purpose: >
   Incrementally sync indienova WeChat articles whose titles contain steam,
   download newly missing articles as lite Markdown with CDN image links, then
   import only this run's new articles into the Knowledge Vault Steam pipeline.
+
+generic_account_recovery:
+  canonical_entry: /Users/adobe/Project/tools/wechat-article-exporter/scripts/wechat2md/workflows/wechat-account-visible-recovery.yaml
+  relationship: indienova is one concrete stable-biz input to the generic account recovery contract; this workflow adds only the case-insensitive steam title filter, Steam manifest import, and complete-state gates.
+  required_read: Read and execute canonical_entry for resource resolution, local reconciliation, normal-Chrome WeRead acquisition, public-index fallback, article evidence, and Dashboard reconciliation. This file does not override those generic safety rules.
+  resource_command: node scripts/wechat2md/account_resource.mjs --account-name indienova --stable-biz MjM5MjIyOTc2Nw== --output-root /Users/adobe/Project/output/WechatArticles
 
 run_identity:
   helper: /Users/adobe/Project/tools/wechat-article-exporter/scripts/wechat2md/run_artifact.py
@@ -17,18 +23,22 @@ run_identity:
 
 account_lease:
   helper: /Users/adobe/Project/tools/wechat-article-exporter/scripts/wechat2md/automation_lease.py
-  resource_id: wechat-account:indienova
-  lease_file: /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-state/leases/accounts/indienova.json
+  resource_id: wechat-account-3f754aba4b02ec9ac576
+  lease_file: /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-state/leases/accounts/wechat-account-3f754aba4b02ec9ac576.json
+  legacy_lease_file: /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-state/leases/accounts/indienova.json
+  migration_bridge_order:
+    - legacy_lease_file
+    - lease_file
+  migration_bridge_rule: Acquire the legacy display-name lease first and then the canonical stable-biz lease through one acquire-set command. Hold and heartbeat both for the full run so an old executor cannot enter between a status check and canonical acquisition. On any partial acquisition failure, the helper owner-checks and rolls back only leases newly acquired by this command.
   ttl_seconds: 3600
-  owner_token_policy: Retain the run owner token in process memory and use the same token for acquire and release.
-  acquire_command: python3 scripts/wechat2md/automation_lease.py acquire --lease-file <lease_file> --workflow-id indienova-steam-incremental --owner-token <owner_token> --ttl-seconds 3600
-  status_command: python3 scripts/wechat2md/automation_lease.py status --lease-file <lease_file>
-  busy_policy: Stop this account run when acquire reports busy; other account workflows remain independent. Never release a lease owned by another token.
-  held_scope: Hold only the indienova account lease across scan, download, manifest creation, dry-run, formal Steam import, verification, and this account's state update.
-  heartbeat_command: python3 scripts/wechat2md/automation_lease.py heartbeat --lease-file <lease_file> --owner-token <owner_token> --ttl-seconds 3600 --interval-seconds 300 --max-lifetime-seconds 43200 --quiet
-  heartbeat_policy: Start and monitor heartbeat immediately after acquire. If it exits, reaches its 12-hour maximum lifetime, or any owner-checked renewal fails, stop before further download, --confirm, or state writes.
-  finally_release: In a finally block, release with the same owner token on success, failure, cancellation, or partial execution.
-  release_command: python3 scripts/wechat2md/automation_lease.py release --lease-file <lease_file> --owner-token <owner_token>
+  owner_token_policy: Retain the run owner token in process memory and use the same token for acquire-set, heartbeat-set, and release-set.
+  acquire_command: python3 scripts/wechat2md/automation_lease.py acquire-set --lease-file <legacy_lease_file> --lease-file <lease_file> --workflow-id indienova-steam-incremental --owner-token <owner_token> --ttl-seconds 3600
+  busy_policy: Stop this account run when either lease is busy; other account workflows remain independent. Never release a lease owned by another token.
+  held_scope: Hold both the legacy bridge lease and canonical account lease across scan, download, manifest creation, dry-run, formal Steam import, verification, and this account's state update.
+  heartbeat_command: python3 scripts/wechat2md/automation_lease.py heartbeat-set --lease-file <legacy_lease_file> --lease-file <lease_file> --owner-token <owner_token> --ttl-seconds 3600 --interval-seconds 300 --max-lifetime-seconds 43200 --quiet
+  heartbeat_policy: Start and monitor the set heartbeat immediately after acquire-set. If either renewal fails or it reaches the 12-hour maximum lifetime, stop before further download, --confirm, or state writes.
+  finally_release: In a finally block, release-set both paths with the same owner token on success, failure, cancellation, or partial execution.
+  release_command: python3 scripts/wechat2md/automation_lease.py release-set --lease-file <legacy_lease_file> --lease-file <lease_file> --owner-token <owner_token>
 
 service_startup_lease:
   helper: /Users/adobe/Project/tools/wechat-article-exporter/scripts/wechat2md/automation_lease.py
@@ -52,7 +62,7 @@ authenticated_api_lease:
     - 30
     - 60
     - 120
-  scope: Serialize only authenticated /api/web/mp/searchbiz and /api/web/mp/appmsgpublish requests that share the WeChat session; downloads and imports never hold this lease.
+  scope: Serialize only authenticated /api/web/mp/appmsgpublish and local profile_ext probe requests that reach WeChat; downloads and imports never hold this lease.
   command_template: python3 scripts/wechat2md/mp_api_request.py --lease-file <lease_file> --owner-token <owner_token> --workflow-id indienova-steam-incremental:wechat-mp-api --lease-ttl-seconds 300 --wait-timeout-seconds 300 --request-timeout-seconds 30 --cooldown-seconds 2 --backoff-seconds 30,60,120 -- <curl request>
   request_policy: Every authenticated request must run through request_helper, which holds the API lease through the response and the full 2-second post-response cooldown before owner-checked release.
   timeout_policy: The localhost MP proxy starts its 25-second budget at proxy entry, aborts the upstream WeChat fetch before request_helper's 30-second client timeout, and refuses to start upstream work when the client already disconnected during token or cookie lookup.
@@ -67,11 +77,29 @@ concurrency:
   write_policy: Account output/state paths are disjoint. Product structured writes retain their own writer lock; this workflow writes only Steam raw/document records while holding the indienova account lease.
 
 sync_state:
+  helper: /Users/adobe/Project/tools/wechat-article-exporter/scripts/wechat2md/sync_state.py
   scope: one_file_per_account
-  path: /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-state/accounts/indienova.json
+  path: /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-state/accounts/wechat-account-3f754aba4b02ec9ac576.json
+  legacy_account_read_fallback: /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-state/accounts/indienova.json
   legacy_read_fallback: /Users/adobe/Project/tools/wechat-article-exporter/.local/wechat2md-state/indienova-steam-incremental.json
-  migration: When the account state is absent, read the legacy file as a fallback but leave it untouched; publish the new account state only after a fully successful run.
-  persistence: Write a temporary JSON file and atomically replace the state file only after the whole leased workflow and its verification succeed.
+  migration: When the canonical stable-biz state is absent, validate both legacy candidates without modifying them. Use the only valid candidate, or one value when all valid candidates are semantically identical. If valid candidates conflict, treat state as missing, force the full date-floor integrity audit, report state_migration_conflict, and do not publish canonical state until that complete audit and every downstream gate succeeds.
+  snapshot_file: <run_dir>/wechat-account-3f754aba4b02ec9ac576-state-snapshot.json
+  candidate_file: <run_dir>/wechat-account-3f754aba4b02ec9ac576-state-candidate.json
+  gate_file: <run_dir>/wechat-account-3f754aba4b02ec9ac576-state-gate.json
+  snapshot_command: python3 scripts/wechat2md/sync_state.py snapshot --state-file <path> --snapshot-file <snapshot_file>
+  gate_schema:
+    complete_source_probe_succeeded: true only after full overlap/date-floor pagination
+    required_integrity_audit_completed: true when no audit is due or the required full audit completed
+    manifest_and_downstream_succeeded: true only for an empty verified no-op or successful Steam dry-run plus confirm
+    lease_heartbeat_active: true only after both legacy and canonical lease ownership are rechecked
+    post_write_verification_succeeded: true only after all structured verification succeeds
+    state_migration_safe: true when no legacy conflict exists or the conflict was resolved by a completed full audit
+  pre_run_snapshot: Run snapshot_command before scanning to record existence and the exact SHA256. Partial-source success, a skipped or failed complete probe, import failure, heartbeat failure, cancellation, or any verification error must end with the same existence and SHA256.
+  commit_gate: Write every gate_schema field to gate_file and call publish_command. The helper rejects any value other than literal true, rechecks the snapshot before writing, and atomically replaces path only after all gates pass.
+  publish_command: python3 scripts/wechat2md/sync_state.py publish --state-file <path> --snapshot-file <snapshot_file> --candidate-file <candidate_file> --gate-file <gate_file> --lease-file <legacy_lease_file> --lease-file <lease_file> --owner-token <owner_token>
+  failure_verification: On every path where commit_gate is false, run failure_verification_command and require unchanged=true before reporting completion.
+  failure_verification_command: python3 scripts/wechat2md/sync_state.py verify-unchanged --state-file <path> --snapshot-file <snapshot_file>
+  persistence: After an owner-workflow-gated snapshot compare, sync_state.py will atomically replace from the same directory only when the whole leased workflow and its verification succeed.
   schema:
     high_watermark_publish_timestamp: newest successfully reconciled publish timestamp
     high_watermark_article_ids: article ids observed at that timestamp
@@ -93,20 +121,40 @@ service:
   lifecycle: Shared singleton coordinated by service_startup_lease; reuse an already healthy service.
 
 auth:
-  mode: existing_session_only
+  mode: generic_visible_recovery_with_final_authenticated_probe
   auth_key_source: local cookie store used by wechat-article-exporter
   request_header: X-Auth-Key
-  chrome_policy: Chrome is only for relogin or repairing expired session state; normal runs use local HTTP APIs.
-  credential_policy: Do not invent or replace credentials. Stop and report when session/cookie/auth key is missing or expired.
+  chrome_policy: Reuse only the user's already-open normal Google Chrome for the official WeRead visible-directory path or an explicit relogin. Never launch a dedicated profile, another browser, PC WeChat, a system proxy, a trusted certificate, browser-cache extraction, exported cookies, raw CDP, or a private list endpoint.
+  credential_policy: Do not invent, persist, log, export, or replace credentials. Missing or expired authenticated state disables only the final complete-source probe; follow the generic partial-source contract and preserve sync state.
 
 account:
   nickname: indienova
-  fakeid_discovery:
-    endpoint: /api/web/mp/searchbiz
-    keyword: indienova
+  stable_biz: MjM5MjIyOTc2Nw==
+  fakeid: MjM5MjIyOTc2Nw==
+  resource_key: wechat-account-3f754aba4b02ec9ac576
+  output_dir: /Users/adobe/Project/output/WechatArticles/indienova
+  fakeid_policy: Reuse the validated stable_biz value directly for a final authenticated probe. Do not call searchbiz merely to rediscover this known account.
 
 article_scan:
-  endpoint: /api/web/mp/appmsgpublish
+  source_priority:
+    canonical_contract: generic_account_recovery.canonical_entry
+    routine_order:
+      - local_canonical_export_reconciliation
+      - normal_chrome_visible_weread
+      - public_index_fallback
+      - authenticated_complete_source_probe
+    preferred_acquisition: Execute the generic workflow with account.nickname, account.stable_biz, the active overlap or audit boundary, and account.output_dir. Do not call searchbiz, appmsgpublish, or profile_ext first when the authenticated path is known to be frequency controlled.
+    partial_filter: From local, WeRead, and public-index candidates, retain only articles whose title contains steam case-insensitively and whose publication date is on or after publish_date_min. Stable biz, positive mid and idx, exact title/date evidence, and nonempty body remain mandatory.
+    partial_state_policy: Verified partial-source downloads may enter this run's Steam manifest and import, but never complete bounded overlap, advance high-watermark, or complete an integrity audit. Preserve prior state unless authenticated_complete_source_probe fully succeeds.
+    user_action_policy: existing_chrome_unavailable, login_required, or captcha_required stops visible acquisition with an actionable warning and never switches browser. Other non-user-action failures may continue to the bounded public index.
+  authenticated_complete_source_probe:
+    endpoints:
+      - /api/web/mp/appmsgpublish
+      - /api/local/wechat2md/article-list
+    trigger: Final probe only after the preferred and partial paths. Skip when current source-health evidence marks the authenticated list path frequency controlled or no fresh local session/Credential exists.
+    request_policy: Every page request that reaches WeChat must use authenticated_api_lease and mp_api_request.py. Apply the same title filter, high-watermark, dynamic overlap, date floor, progress guards, and local index.md reconciliation to either endpoint.
+    success_policy: Only a fully paginated overlap-complete or date-floor-complete probe may update high-watermark or integrity-audit state. A nonzero ret, repeated offset/page signature, timeout, owner loss, or page-limit breach preserves prior state.
+    partial_preservation: Failure of this final probe does not discard already verified partial-source downloads or a successful manifest-scoped Steam import; it only blocks complete sync-state advancement.
   keyword: steam
   title_match: case_insensitive_contains
   publish_date_min: "2020-01-01"
@@ -150,6 +198,8 @@ download:
     imageMode: cdn
     outputDir: /Users/adobe/Project/output/WechatArticles
     accountName: indienova
+    expectedBiz: MjM5MjIyOTc2Nw==
+    canonicalUrl: verified canonical WeChat URL from the selected source evidence
   post_download_cleanup:
     scope: current_run_articles_only
     remove_images_dir_when_present: false
@@ -169,7 +219,7 @@ file_manifest:
       - /Users/adobe/Project/output/WechatArticles/indienova/<article-title>/index.md
   path_policy: entries must point to Markdown files under article_scan.local_download_check.root
   reason: import-steam-indienova.py supports --file-list, so this workflow no longer copies Markdown into a staging directory.
-  empty_run_policy: If files is empty after successful reconciliation, skip both Steam import commands, advance verified sync state, and report a successful no-op with zero import counts.
+  empty_run_policy: If files is empty after successful reconciliation, skip both Steam import commands and report a successful no-op with zero import counts. Advance sync state only when authenticated_complete_source_probe fully completed; every partial-source no-op preserves prior state.
 
 steam_import:
   cwd: /Users/adobe/Project/knowledge-vault
@@ -215,6 +265,23 @@ steam_import:
 
 report:
   required_fields:
+    - account_name
+    - stable_biz
+    - resource_key
+    - source_order_attempted
+    - scan_coverage
+    - local_canonical_records
+    - local_recovered_articles
+    - local_rejected_records
+    - weread_status
+    - weread_initial_directory_entries
+    - weread_directory_entries_loaded
+    - weread_scroll_steps
+    - weread_boundary_reached
+    - public_index_verified_articles
+    - complete_source_probe_status
+    - partial_source_warnings
+    - sync_state_update_result
     - latest_synced_article_count
     - steam_title_candidate_count
     - new_download_count
@@ -223,6 +290,7 @@ report:
     - file_manifest
     - lease_result
     - account_lease_result
+    - legacy_bridge_lease_result
     - service_startup_lease_result
     - service_compatibility_result
     - authenticated_api_lease_result
@@ -238,6 +306,9 @@ report:
     - formal_import_unchanged_count
     - formal_import_error_count
     - unmatched_or_review_count
+    - state_migration_result
+    - sync_state_snapshot_result
+    - sync_state_gate_result
 
 last_verified_run:
   date: "2026-07-01"

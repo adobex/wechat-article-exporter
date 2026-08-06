@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Owner-token lease used to serialize long-running wechat2md automations."""
+"""Owner-token leases used to serialize long-running wechat2md automations."""
 
 from __future__ import annotations
 
@@ -191,6 +191,61 @@ def acquire_lease(
         }
 
 
+def normalize_lease_set(paths: list[Path]) -> list[Path]:
+    normalized = [path.expanduser().resolve() for path in paths]
+    if not normalized:
+        raise ValueError("at least one lease_file is required")
+    if len(normalized) != len(set(normalized)):
+        raise ValueError("lease_file entries must be unique")
+    return normalized
+
+
+def acquire_lease_set(
+    paths: list[Path],
+    *,
+    owner_token: str,
+    ttl_seconds: float,
+    workflow_id: str,
+) -> dict[str, Any]:
+    """Acquire an ordered compatibility bridge and roll back on partial failure."""
+    normalized = normalize_lease_set(paths)
+    results: list[dict[str, Any]] = []
+    newly_acquired: list[Path] = []
+    for path in normalized:
+        try:
+            result = acquire_lease(
+                path,
+                owner_token=owner_token,
+                ttl_seconds=ttl_seconds,
+                workflow_id=workflow_id,
+            )
+        except (OSError, ValueError, json.JSONDecodeError):
+            for acquired_path in reversed(newly_acquired):
+                release_lease(acquired_path, owner_token=owner_token)
+            raise
+        results.append(result)
+        if not result["acquired"]:
+            rollback = [
+                release_lease(acquired_path, owner_token=owner_token)
+                for acquired_path in reversed(newly_acquired)
+            ]
+            return {
+                "acquired": False,
+                "result": "busy",
+                "busy_lease_file": result["lease_file"],
+                "leases": results,
+                "rollback": rollback,
+            }
+        if result["result"] != "already-owned":
+            newly_acquired.append(path)
+    return {
+        "acquired": True,
+        "result": "acquired-set",
+        "lease_files": [str(path) for path in normalized],
+        "leases": results,
+    }
+
+
 def release_lease(path: Path, *, owner_token: str) -> dict[str, Any]:
     path = path.expanduser().resolve()
     owner_token = owner_token.strip()
@@ -264,6 +319,32 @@ def renew_lease(
         }
 
 
+def renew_lease_set(
+    paths: list[Path],
+    *,
+    owner_token: str,
+    ttl_seconds: float,
+) -> dict[str, Any]:
+    normalized = normalize_lease_set(paths)
+    results: list[dict[str, Any]] = []
+    for path in normalized:
+        result = renew_lease(path, owner_token=owner_token, ttl_seconds=ttl_seconds)
+        results.append(result)
+        if not result["renewed"]:
+            return {
+                "renewed": False,
+                "result": result["result"],
+                "failed_lease_file": result["lease_file"],
+                "leases": results,
+            }
+    return {
+        "renewed": True,
+        "result": "renewed-set",
+        "lease_files": [str(path) for path in normalized],
+        "leases": results,
+    }
+
+
 def heartbeat_lease(
     path: Path,
     *,
@@ -291,6 +372,58 @@ def heartbeat_lease(
         sleep(interval_seconds)
 
 
+def heartbeat_lease_set(
+    paths: list[Path],
+    *,
+    owner_token: str,
+    ttl_seconds: float,
+    interval_seconds: float,
+    max_lifetime_seconds: float,
+    quiet: bool = False,
+    sleep: Any = time.sleep,
+    monotonic: Any = time.monotonic,
+) -> int:
+    normalized = normalize_lease_set(paths)
+    if interval_seconds <= 0 or interval_seconds >= ttl_seconds:
+        raise ValueError("interval_seconds must be greater than zero and less than ttl_seconds")
+    if max_lifetime_seconds <= 0:
+        raise ValueError("max_lifetime_seconds must be greater than zero")
+    started_at = monotonic()
+    while True:
+        if monotonic() - started_at >= max_lifetime_seconds:
+            return 6
+        result = renew_lease_set(
+            normalized,
+            owner_token=owner_token,
+            ttl_seconds=ttl_seconds,
+        )
+        if not quiet or not result["renewed"]:
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True), flush=True)
+        if not result["renewed"]:
+            return 5
+        sleep(interval_seconds)
+
+
+def release_lease_set(paths: list[Path], *, owner_token: str) -> dict[str, Any]:
+    normalized = normalize_lease_set(paths)
+    results: list[dict[str, Any]] = []
+    for path in reversed(normalized):
+        result = release_lease(path, owner_token=owner_token)
+        results.append(result)
+        if result["result"] not in {"released", "already-absent"}:
+            break
+    failed = [result for result in results if result["result"] not in {"released", "already-absent"}]
+    return {
+        "released": not failed,
+        "result": "released-set" if not failed else "release-failed",
+        "lease_files": [str(path) for path in normalized],
+        "leases": results,
+        "unreleased_lease_files": [
+            str(path) for path in reversed(normalized[: len(normalized) - len(results)])
+        ],
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Acquire, inspect, or release a wechat2md automation lease.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -300,6 +433,12 @@ def build_parser() -> argparse.ArgumentParser:
     acquire.add_argument("--workflow-id", required=True)
     acquire.add_argument("--owner-token", default="", help="Defaults to a generated UUID; retain it for release.")
     acquire.add_argument("--ttl-seconds", type=float, required=True)
+
+    acquire_set = subparsers.add_parser("acquire-set")
+    acquire_set.add_argument("--lease-file", action="append", type=Path, required=True)
+    acquire_set.add_argument("--workflow-id", required=True)
+    acquire_set.add_argument("--owner-token", default="", help="Defaults to a generated UUID; retain it for release.")
+    acquire_set.add_argument("--ttl-seconds", type=float, required=True)
 
     status = subparsers.add_parser("status")
     status.add_argument("--lease-file", type=Path, required=True)
@@ -317,9 +456,21 @@ def build_parser() -> argparse.ArgumentParser:
     heartbeat.add_argument("--max-lifetime-seconds", type=float, default=43200)
     heartbeat.add_argument("--quiet", action="store_true")
 
+    heartbeat_set = subparsers.add_parser("heartbeat-set")
+    heartbeat_set.add_argument("--lease-file", action="append", type=Path, required=True)
+    heartbeat_set.add_argument("--owner-token", required=True)
+    heartbeat_set.add_argument("--ttl-seconds", type=float, required=True)
+    heartbeat_set.add_argument("--interval-seconds", type=float, required=True)
+    heartbeat_set.add_argument("--max-lifetime-seconds", type=float, default=43200)
+    heartbeat_set.add_argument("--quiet", action="store_true")
+
     release = subparsers.add_parser("release")
     release.add_argument("--lease-file", type=Path, required=True)
     release.add_argument("--owner-token", required=True)
+
+    release_set = subparsers.add_parser("release-set")
+    release_set.add_argument("--lease-file", action="append", type=Path, required=True)
+    release_set.add_argument("--owner-token", required=True)
     return parser
 
 
@@ -328,6 +479,14 @@ def main() -> int:
     try:
         if args.command == "acquire":
             result = acquire_lease(
+                args.lease_file,
+                owner_token=args.owner_token or str(uuid.uuid4()),
+                ttl_seconds=args.ttl_seconds,
+                workflow_id=args.workflow_id,
+            )
+            exit_code = 0 if result["acquired"] else 3
+        elif args.command == "acquire-set":
+            result = acquire_lease_set(
                 args.lease_file,
                 owner_token=args.owner_token or str(uuid.uuid4()),
                 ttl_seconds=args.ttl_seconds,
@@ -356,6 +515,21 @@ def main() -> int:
                 )
             except KeyboardInterrupt:
                 return 130
+        elif args.command == "heartbeat-set":
+            try:
+                return heartbeat_lease_set(
+                    args.lease_file,
+                    owner_token=args.owner_token,
+                    ttl_seconds=args.ttl_seconds,
+                    interval_seconds=args.interval_seconds,
+                    max_lifetime_seconds=args.max_lifetime_seconds,
+                    quiet=args.quiet,
+                )
+            except KeyboardInterrupt:
+                return 130
+        elif args.command == "release-set":
+            result = release_lease_set(args.lease_file, owner_token=args.owner_token)
+            exit_code = 0 if result["released"] else 4
         else:
             result = release_lease(args.lease_file, owner_token=args.owner_token)
             exit_code = 0 if result["result"] in {"released", "already-absent"} else 4
