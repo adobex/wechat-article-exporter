@@ -1,10 +1,15 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, test, vi } from 'vitest';
 import { wechat2md } from '../server/utils/wechat2md';
 
-const outputRoot = `/Users/adobe/Project/output/WechatArticles/.wechat2md-test-${randomUUID()}`;
+const outputRoot = join(
+  process.env.WECHAT2MD_OUTPUT_DIR || join(tmpdir(), 'wechat-article-exporter-tests'),
+  `.wechat2md-test-${randomUUID()}`
+);
 
 afterEach(() => {
   rmSync(outputRoot, { recursive: true, force: true });

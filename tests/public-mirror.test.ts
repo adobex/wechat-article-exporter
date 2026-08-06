@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   discoverKchuhaiMirrorArticles,
@@ -13,7 +15,10 @@ const BIZ = 'Mzg5MTcwMTI5Nw==';
 const ACCOUNT = '王董的新游戏';
 const MIRROR_URL = 'https://www.kchuhai.com/report/view-67492.html';
 const ORIGINAL_URL = 'https://mp.weixin.qq.com/s/8H8wsFPjjiK_LU90xMkK-Q';
-const outputRoot = `/Users/adobe/Project/output/WechatArticles/.wechat2md-mirror-test-${randomUUID()}`;
+const outputRoot = join(
+  process.env.WECHAT2MD_OUTPUT_DIR || join(tmpdir(), 'wechat-article-exporter-tests'),
+  `.wechat2md-mirror-test-${randomUUID()}`
+);
 
 function mirrorHtml(): string {
   return `<!doctype html><html><body>
